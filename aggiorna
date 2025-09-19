@@ -1,0 +1,41 @@
+#!/bin/bash
+
+#== Colori per gli output ==
+GREEN='\e[32m'
+BLUE='\e[34m'
+RED='\e[31m'
+YELLOW='\e[33m'
+RESET='\e[0m'
+PURPLE='\e[35m'
+
+#== Impostazioni opzioni per successo o errori ==
+log_success() {
+    echo -e "${BOLD}${BLUE}✔ $1 completato con successo.${RESET}"
+}
+
+log_error() {
+    echo -e "${BOLD}${RED}✖ Errore durante: $1${RESET}"
+}
+
+run_step() {
+    local description="$1"
+    shift
+    if "$@"; then
+        log_success "$description"
+    else
+        log_error "$description"
+    fi
+}
+
+#== Inizio aggiornamento e manutenzione ==
+echo -e "${BOLD}${PURPLE}Richiesta password per permessi di root:${RESET}"
+sudo echo -e "${BOLD}${PURPLE}Avvio script di aggiornamento e manutenzione del sistema...${RESET}"
+
+run_step "Aggiornamento APT" sudo apt update && sudo apt upgrade -y
+run_step "Pulizia pacchetti inutilizzati APT" sudo apt autoremove -y
+run_step "Aggiornamento Flatpak" flatpak update -y
+run_step "Rimozione Flatpak non utilizzati" flatpak uninstall --unused -y
+
+echo -e "${BOLD}${PURPLE}✔ Script terminato. Premere un tasto per continuare...${RESET}"
+read
+# == Termine dello script ==
