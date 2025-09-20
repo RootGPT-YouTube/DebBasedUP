@@ -1,13 +1,17 @@
+echo -e "\e[1;35mInstallazione delle dipendenze necessarie: git...\e[0m"
+echo -e "\e[1;35mRichiesta della password di root per installare eventuali dipendenze:\e[0m"
+sudo apt install git -y
+echo -e "\e[1;35mClonazione del repository in corso...\e[0m"
+sleep 3
 git clone https://github.com/RootGPT-YouTube/DebBasedUP.git
-echo -e "\e[1;35mTra un attimo ti sarà richiesta la password di root per rendere eseguibile lo script aggiorna...\e[0m"
 sudo chmod a+x ~/DebBasedUP/aggiorna
 echo -e "\e[1;35mCopia script in /usr/local/bin/...\e[0m"
 sleep 3
 sudo cp ~/DebBasedUP/aggiorna /usr/local/bin/aggiorna
-echo -e "\e[1;35mPulizia repository clonato...\e[0m"
+echo -e "\e[1;35mPulizia del repository clonato...\e[0m"
 sleep 3
 sudo rm -fr ~/DebBasedUP
 echo -e "\e[1;35mFine installazione.\e[0m"
 echo -e "\e[1;35mDa adesso avrai il comando aggiorna da lanciare nel terminale per fare in automatico aggiornamento e manutenzione della tua distro basata su Debian.\e[0m"
-sleep 3
+sleep 5
 read
