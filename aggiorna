@@ -27,6 +27,15 @@ run_step() {
     fi
 }
 
+#== Stemma ==
+echo -e "${GREEN}"
+echo "**************************************"
+echo "*                                    *"
+echo "*       Aggiorna by R∞tGPT           *"
+echo "*                                    *"
+echo "**************************************"
+echo -e "${RESET}"
+
 #== Inizio aggiornamento e manutenzione ==
 echo -e "${BOLD}${PURPLE}Richiesta password per permessi di root:${RESET}"
 sudo echo -e "${BOLD}${PURPLE}Avvio script di aggiornamento e manutenzione del sistema...${RESET}"
