@@ -30,9 +30,9 @@ run_step() {
 #== Stemma ==
 echo -e "${GREEN}"
 echo "**************************************"
-echo "*                                                               *"
-echo "*       Aggiorna by R∞tGPT 2.0           *"
-echo "*                                                               *"
+echo "*                                    *"
+echo "*       Aggiorna by R∞tGPT 2.0       *"
+echo "*                                    *"
 echo "**************************************"
 echo -e "${RESET}"
 
@@ -47,13 +47,22 @@ run_step "Rimozione Flatpak non utilizzati" flatpak uninstall --unused -y
 
 #== Controlla ed esegui cromup se presente ==
 if [ -x "/usr/local/bin/cromup" ]; then
-    run_step "Esecuzione cromup" /usr/local/bin/cromup
+    cromup
 fi
 
 #== Autoaggiornamento dello script ==
 echo -e "${BOLD}${PURPLE}Controllo aggiornamenti dello script...${RESET}"
-sudo curl -fsSL https://raw.githubusercontent.com/RootGPT-YouTube/DebBasedUP/main/aggiorna -o /usr/local/bin/aggiorna && sudo chmod a+x /usr/local/bin/aggiorna
-log_success "Verifica aggiornamenti script"
+{
+    sudo curl -fsSL https://raw.githubusercontent.com/RootGPT-YouTube/DebBasedUP/main/aggiorna -o /tmp/aggiorna.tmp && \
+    sudo mv /tmp/aggiorna.tmp /usr/local/bin/aggiorna && \
+    sudo chmod a+x /usr/local/bin/aggiorna
+    log_success "Verifica aggiornamenti script"
+} 2>/dev/null
+
+#== Ultimo messaggio ==
+echo -e "${BOLD}${PURPLE}✔ Script terminato. Premere un tasto per continuare...${RESET}"
+read
+# == Termine dello script ==
 
 echo -e "${BOLD}${PURPLE}✔ Script terminato. Premere un tasto per continuare...${RESET}"
 read
