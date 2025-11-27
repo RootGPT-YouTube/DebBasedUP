@@ -31,7 +31,7 @@ run_step() {
 echo -e "${GREEN}"
 echo "****************************"
 echo "*                          *"
-echo "*  Aggiorna by R∞tGPT 2.0  *"
+echo "*  Aggiorna 2.0 by R∞tGPT  *"
 echo "*                          *"
 echo "****************************"
 echo -e "${RESET}"
