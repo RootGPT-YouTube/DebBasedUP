@@ -32,7 +32,7 @@ run_step() {
 echo -e "${GREEN}"
 echo "****************************"
 echo "*                          *"
-echo "*  Aggiorna 3.0 by R∞tGPT  *"
+echo "*  Aggiorna 3.1 by R∞tGPT  *"
 echo "*                          *"
 echo "****************************"
 echo -e "${RESET}"
@@ -63,10 +63,16 @@ fi
 echo -e "${BOLD}${GREEN}✔ Tutte le dipendenze sono state risolte.${RESET}"
 
 #== Aggiornamento e manutenzione con Nala ==
-run_step "Aggiornamento Nala" sudo nala update && sudo nala upgrade -y
-run_step "Pulizia pacchetti inutilizzati Nala" sudo nala autoremove -y
-run_step "Aggiornamento Flatpak" flatpak update -y
-run_step "Rimozione Flatpak non utilizzati" flatpak uninstall --unused -y
+echo -e "${BOLD}${PURPLE}Aggiornamento repository APT...${RESET}"
+run_step "Aggiornamento repository APT" sudo nala update
+echo -e "${BOLD}${PURPLE}Aggiornamento apps del repository APT...${RESET}"
+run_step "Aggiornamento apps installate dal repository APT" sudo nala upgrade -y
+echo -e "${BOLD}${PURPLE}Pulizia dei pacchetti obsoleti o orfani installati dal repository APT...${RESET}"
+run_step "Pulizia pacchetti inutilizzati APT" sudo nala autoremove -y
+echo -e "${BOLD}${PURPLE}Aggiornamento apps FLATPAK...${RESET}"
+run_step "Aggiornamento FLATPAK" flatpak update -y
+echo -e "${BOLD}${PURPLE}Pulizia di componenti FLATPAK inutilizzati...${RESET}"
+run_step "Rimozione FLATPAK non utilizzati" flatpak uninstall --unused -y
 
 #== Controlla ed esegui cromup se presente ==
 if [ -x "/usr/local/bin/cromup" ]; then
