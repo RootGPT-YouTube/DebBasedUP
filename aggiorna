@@ -63,6 +63,7 @@ fi
 echo -e "${BOLD}${GREEN}✔ Tutte le dipendenze sono state risolte.${RESET}"
 
 #== Aggiornamento e manutenzione con Nala ==
+echo ""
 echo -e "${BOLD}${PURPLE}Aggiornamento repository APT...${RESET}"
 run_step "Aggiornamento repository APT" sudo nala update
 echo ""
