@@ -62,6 +62,7 @@ fi
 
 echo -e "${BOLD}${GREEN}✔ Tutte le dipendenze sono state risolte.${RESET}"
 echo
+sleep 2
 
 #== Aggiornamento e manutenzione con Nala ==
 #echo -e "${BOLD}${PURPLE}Aggiornamento repository APT...${RESET}"
@@ -83,7 +84,7 @@ sleep 1
 echo -e "${BOLD}${PURPLE}Pulizia di componenti FLATPAK inutilizzati...${RESET}"
 run_step "Rimozione FLATPAK non utilizzati" flatpak uninstall --unused -y
 echo
-sleep 1
+sleep 2
 
 #== Controlla ed esegui cromup se presente ==
 if [ -x "/usr/local/bin/cromup" ]; then
