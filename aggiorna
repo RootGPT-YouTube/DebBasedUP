@@ -32,7 +32,7 @@ run_step() {
 echo -e "${GREEN}"
 echo "****************************"
 echo "*                          *"
-echo "*  Aggiorna 3.1 by R∞tGPT  *"
+echo "*  Aggiorna 3.2 by R∞tGPT  *"
 echo "*                          *"
 echo "****************************"
 echo -e "${RESET}"
@@ -64,12 +64,12 @@ echo -e "${BOLD}${GREEN}✔ Tutte le dipendenze sono state risolte.${RESET}"
 echo
 
 #== Aggiornamento e manutenzione con Nala ==
-echo -e "${BOLD}${PURPLE}Aggiornamento repository APT...${RESET}"
-run_step "Aggiornamento repository APT" sudo nala update
-echo
-sleep 1
-echo -e "${BOLD}${PURPLE}Aggiornamento apps del repository APT...${RESET}"
-run_step "Aggiornamento apps installate dal repository APT" sudo nala upgrade -y
+#echo -e "${BOLD}${PURPLE}Aggiornamento repository APT...${RESET}"
+#run_step "Aggiornamento repository APT" sudo nala update
+#echo
+#sleep 1
+echo -e "${BOLD}${PURPLE}Aggiornamento Repository APT e delle relative apps installate...${RESET}"
+run_step "Aggiornamento Repository APT e delle relative apps" sudo nala upgrade -y
 echo
 sleep 1
 echo -e "${BOLD}${PURPLE}Pulizia dei pacchetti obsoleti o orfani installati dal repository APT...${RESET}"
