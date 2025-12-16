@@ -70,7 +70,7 @@ sleep 2
 #echo
 #sleep 1
 echo -e "${BOLD}${PURPLE}Aggiornamento Repository APT e delle relative apps installate...${RESET}"
-run_step "Aggiornamento Repository APT e delle relative apps" sudo nala upgrade --update -v -y
+run_step "Aggiornamento Repository APT e delle relative apps" sudo nala upgrade --update -y
 echo
 sleep 1
 echo -e "${BOLD}${PURPLE}Pulizia dei pacchetti obsoleti o orfani installati dal repository APT...${RESET}"
