@@ -1,105 +1,212 @@
 #!/bin/bash
+#
+# Aggiorna 3.4 — manutenzione e aggiornamento di distro basate su Debian
+# by R∞tGPT — interfaccia originale "pipeline" (nessuna parentela con Nala)
+#
 
-#== Colori per gli output ==
-GREEN='\e[32m'
-BLUE='\e[34m'
-RED='\e[31m'
-YELLOW='\e[33m'
-RESET='\e[0m'
-PURPLE='\e[35m'
-BOLD='\e[1m'
+#== Colori (ESC reali, così funzionano sia con printf che con echo) ==
+RESET=$'\e[0m'
+BOLD=$'\e[1m'
+DIM=$'\e[38;2;96;106;128m'      # grigio-ardesia per le linee
+GREEN=$'\e[38;2;80;220;130m'
+RED=$'\e[38;2;255;95;95m'
+CYAN=$'\e[38;2;0;220;210m'
+GOLD=$'\e[38;2;255;200;90m'
 
-#== Impostazioni opzioni per successo o errori ==
-log_success() {
-    echo -e "${BOLD}${BLUE}✔ $1 completato con successo.${RESET}"
+#== Stato globale ==
+steps_ok=0
+steps_fail=0
+SCRIPT_UPDATE='—'
+FIRST_STEP=1
+
+#== Utilità ==================================================================
+
+# ripete un carattere (anche multibyte) n volte
+rep() { local n=$1 ch=$2 i; for ((i=0; i<n; i++)); do printf '%s' "$ch"; done; }
+
+# scrive del testo applicando un gradiente truecolor da (r1,g1,b1) a (r2,g2,b2)
+grad_text() {
+    local text="$1" r1=$2 g1=$3 b1=$4 r2=$5 g2=$6 b2=$7
+    local len=${#text} i r g b den
+    den=$(( len > 1 ? len - 1 : 1 ))
+    for ((i=0; i<len; i++)); do
+        r=$(( r1 + (r2 - r1) * i / den ))
+        g=$(( g1 + (g2 - g1) * i / den ))
+        b=$(( b1 + (b2 - b1) * i / den ))
+        printf '\e[1m\e[38;2;%d;%d;%dm%s' "$r" "$g" "$b" "${text:i:1}"
+    done
+    printf '%s' "$RESET"
 }
 
-log_error() {
-    echo -e "${BOLD}${RED}✖ Errore durante: $1${RESET}"
-}
+fmt_time() { printf '%02d:%02d' $(( $1 / 60 )) $(( $1 % 60 )); }
 
-run_step() {
-    local description="$1"
-    shift
-    if "$@"; then
-        log_success "$description"
-    else
-        log_error "$description"
+kb_to_human() {
+    local kb=$1 sign=''
+    (( kb < 0 )) && { sign='-'; kb=$(( -kb )); }
+    if   (( kb >= 1048576 )); then printf '%s%d.%d GiB' "$sign" $(( kb/1048576 )) $(( (kb%1048576)*10/1048576 ))
+    elif (( kb >= 1024    )); then printf '%s%d MiB' "$sign" $(( kb/1024 ))
+    else                           printf '%s%d KiB' "$sign" "$kb"
     fi
 }
 
-#== Stemma ==
-echo -e "${GREEN}"
-echo "****************************"
-echo "*                          *"
-echo "*  Aggiorna 3.4 by R∞tGPT  *"
-echo "*                          *"
-echo "****************************"
-echo -e "${RESET}"
+#== Header a gradiente ========================================================
+header() {
+    local cols width
+    cols=$(tput cols 2>/dev/null || echo 56)
+    width=$(( cols < 56 ? cols : 56 ))
+    (( width < 24 )) && width=24
+    local bar; bar=$(rep $(( width - 4 )) '━')
 
-#== Inizio aggiornamento e manutenzione ==
-echo -e "${BOLD}${PURPLE}Richiesta password per permessi di root:${RESET}"
-sudo echo -e "${BOLD}${PURPLE}Avvio script di aggiornamento e manutenzione del sistema...${RESET}"
+    echo
+    printf '  '; grad_text "$bar" 60 110 200 0 220 210; echo
+    printf '   '; grad_text "A G G I O R N A" 70 130 230 0 220 200
+    printf '    %s•%s  ' "$DIM" "$RESET"; grad_text "R∞tGPT" 0 220 200 180 90 255
+    printf '   %sv3.4%s' "$DIM" "$RESET"; echo
+    printf '  '; grad_text "$bar" 0 220 210 60 110 200; echo
+    echo
+}
 
-#== Controllo dipendenze ==
-echo -e "${BOLD}${YELLOW}Ricerca dipendenze in corso...${RESET}"
+#== Esecuzione di uno step della pipeline =====================================
+# run_step "Etichetta" comando args...
+run_step() {
+    local label="$1"; shift
+    local log; log=$(mktemp)
+    local frames=('◜' '◠' '◝' '◞' '◡' '◟')   # arco rotante (non braille!)
 
-# Verifica se nala è installato
-if ! command -v nala &> /dev/null; then
-    echo -e "${BOLD}${YELLOW}Nala non trovato. Installazione in corso...${RESET}"
-    sudo apt update
-    sudo apt install -y nala
-    if [ $? -eq 0 ]; then
-        log_success "Installazione Nala"
+    # connettore verticale tra un nodo e l'altro
+    if (( FIRST_STEP )); then FIRST_STEP=0; else printf '   %s┃%s\n' "$DIM" "$RESET"; fi
+
+    "$@" >"$log" 2>&1 &
+    local pid=$! start=$SECONDS i=0
+    while kill -0 "$pid" 2>/dev/null; do
+        local f="${frames[$(( i % 6 ))]}"
+        printf '\r   %s%s%s  %s   %s%s%s\e[K' \
+            "$CYAN" "$f" "$RESET" "$label" "$DIM" "$(fmt_time $(( SECONDS - start )))" "$RESET"
+        i=$(( i + 1 ))
+        sleep 0.12
+    done
+    wait "$pid"; local rc=$?
+
+    if (( rc == 0 )); then
+        printf '\r   %s●%s  %s\e[K\n' "$GREEN" "$RESET" "$label"
+        steps_ok=$(( steps_ok + 1 ))
     else
-        log_error "Installazione Nala"
-        echo -e "${BOLD}${RED}Impossibile installare Nala. Lo script terminerà.${RESET}"
+        printf '\r   %s✗%s  %s%s%s\e[K\n' "$RED" "$RESET" "$RED" "$label" "$RESET"
+        steps_fail=$(( steps_fail + 1 ))
+        # in caso di errore mostra le ultime righe del log in un riquadro
+        printf '   %s┃%s\n' "$DIM" "$RESET"
+        printf '   %s┗━ dettaglio errore ─────────────────────────%s\n' "$RED" "$RESET"
+        tail -n 8 "$log" | sed "s/^/      ${DIM}│${RESET} /"
+        printf '   %s──────────────────────────────────────────────%s\n' "$RED" "$RESET"
+    fi
+    rm -f "$log"
+    return "$rc"
+}
+
+#== Scheda di resoconto =======================================================
+card_line() {
+    local label="$1" value="$2" vcolor="$3"
+    local inner=46
+    local left="  ${label}"
+    local pad=$(( inner - ${#left} - ${#value} - 2 ))
+    (( pad < 1 )) && pad=1
+    printf '  %s│%s%s%*s%s%s%s  %s│%s\n' \
+        "$CYAN" "$RESET" "$left" "$pad" '' "$vcolor" "$value" "$RESET" "$CYAN" "$RESET"
+}
+
+report_card() {
+    local inner=46
+    local rule; rule=$(rep "$inner" '─')
+    local title='R E S O C O N T O'
+    local tpad=$(( (inner - ${#title}) / 2 ))
+
+    echo
+    printf '  %s╭%s╮%s\n' "$CYAN" "$rule" "$RESET"
+    printf '  %s│%s%*s%s%s%s%*s%s│%s\n' \
+        "$CYAN" "$RESET" "$tpad" '' "$GOLD$BOLD" "$title" "$RESET" \
+        $(( inner - tpad - ${#title} )) '' "$CYAN" "$RESET"
+    printf '  %s├%s┤%s\n' "$CYAN" "$rule" "$RESET"
+
+    local ok_color="$GREEN"; (( steps_fail > 0 )) && ok_color="$GOLD"
+    card_line "Operazioni riuscite" "${steps_ok}/$(( steps_ok + steps_fail ))" "$ok_color$BOLD"
+    card_line "Tempo impiegato"     "$(fmt_time "$SECONDS")"                    "$BOLD"
+    local freed=$(( END_AVAIL - START_AVAIL ))
+    if (( freed >= 0 )); then
+        card_line "Spazio liberato"  "$(kb_to_human "$freed")"   "$GREEN$BOLD"
+    else
+        card_line "Spazio occupato"  "$(kb_to_human "$(( -freed ))")" "$GOLD$BOLD"
+    fi
+    card_line "Aggiornamento script" "$SCRIPT_UPDATE"            "$BOLD"
+
+    printf '  %s╰%s╯%s\n' "$CYAN" "$rule" "$RESET"
+    echo
+}
+
+#== Pulizia finale: ripristina il cursore e ferma il keep-alive sudo ==========
+cleanup() {
+    printf '\e[?25h'                                   # mostra di nuovo il cursore
+    [ -n "${SUDO_PID:-}" ] && kill "$SUDO_PID" 2>/dev/null
+}
+trap cleanup EXIT INT TERM
+
+#== AVVIO =====================================================================
+clear
+header
+
+# Credenziali root + keep-alive (gli step girano in background con output nascosto,
+# quindi sudo non deve mai fermarsi a chiedere la password a metà corsa)
+printf '   %s🔑 Autenticazione amministratore richiesta...%s\n\n' "$GOLD" "$RESET"
+if ! sudo -v; then
+    printf '   %s✗ Autenticazione fallita. Uscita.%s\n' "$RED" "$RESET"
+    exit 1
+fi
+( while true; do sudo -n true; sleep 50; kill -0 "$$" 2>/dev/null || exit; done ) 2>/dev/null &
+SUDO_PID=$!
+
+printf '\e[?25l'                                        # nasconde il cursore
+START_AVAIL=$(df --output=avail / | tail -1 | tr -d ' ')
+
+# Dipendenza: Nala (installata al volo se assente)
+if ! command -v nala >/dev/null 2>&1; then
+    run_step "Installazione di Nala (dipendenza)" bash -c 'sudo apt update && sudo apt install -y nala'
+    if ! command -v nala >/dev/null 2>&1; then
+        printf '\e[?25h'
+        printf '   %s✗ Impossibile installare Nala. Lo script termina.%s\n' "$RED" "$RESET"
         exit 1
     fi
+fi
+
+run_step "Aggiornamento del sistema (Nala)"   sudo nala upgrade --update --full -y
+run_step "Rimozione dei pacchetti orfani"     sudo nala autoremove -y
+run_step "Aggiornamento delle Flatpak"        flatpak update -y
+run_step "Pulizia delle Flatpak inutilizzate" flatpak uninstall --unused -y
+
+# Hook opzionale: cromup
+if [ -x /usr/local/bin/cromup ]; then
+    run_step "Aggiornamento Cromite (cromup)" cromup
+fi
+
+END_AVAIL=$(df --output=avail / | tail -1 | tr -d ' ')
+
+#== Autoaggiornamento dello script ============================================
+if curl -fsSL https://raw.githubusercontent.com/RootGPT-YouTube/DebBasedUP/main/aggiorna -o /tmp/aggiorna.tmp 2>/dev/null; then
+    if ! cmp -s /tmp/aggiorna.tmp /usr/local/bin/aggiorna 2>/dev/null; then
+        if sudo mv /tmp/aggiorna.tmp /usr/local/bin/aggiorna && sudo chmod a+x /usr/local/bin/aggiorna; then
+            SCRIPT_UPDATE='aggiornato ✓'
+        else
+            SCRIPT_UPDATE='errore ✗'
+        fi
+    else
+        SCRIPT_UPDATE='già aggiornato'
+        rm -f /tmp/aggiorna.tmp
+    fi
 else
-    echo -e "${BOLD}${BLUE}Nala già presente nel sistema.${RESET}"
+    rm -f /tmp/aggiorna.tmp
+    SCRIPT_UPDATE='non verificato'
 fi
 
-echo -e "${BOLD}${GREEN}✔ Tutte le dipendenze sono state risolte.${RESET}"
-echo
-sleep 2
-
-#== Aggiornamento e manutenzione con Nala ==
-#echo -e "${BOLD}${PURPLE}Aggiornamento repository APT...${RESET}"
-#run_step "Aggiornamento repository APT" sudo nala update
-#echo
-#sleep 1
-echo -e "${BOLD}${PURPLE}Aggiornamento Repository APT e delle relative apps installate...${RESET}"
-run_step "Aggiornamento Repository APT e delle relative apps" sudo nala upgrade --update --full -y
-echo
-sleep 1
-echo -e "${BOLD}${PURPLE}Pulizia dei pacchetti obsoleti o orfani installati dal repository APT...${RESET}"
-run_step "Pulizia pacchetti inutilizzati APT" sudo nala autoremove -y
-echo
-sleep 1
-echo -e "${BOLD}${PURPLE}Aggiornamento apps FLATPAK...${RESET}"
-run_step "Aggiornamento FLATPAK" flatpak update -y
-echo
-sleep 1
-echo -e "${BOLD}${PURPLE}Pulizia di componenti FLATPAK inutilizzati...${RESET}"
-run_step "Rimozione FLATPAK non utilizzati" flatpak uninstall --unused -y
-echo
-sleep 2
-
-#== Controlla ed esegui cromup se presente ==
-if [ -x "/usr/local/bin/cromup" ]; then
-    cromup
-fi
-
-#== Autoaggiornamento dello script ==
-echo -e "${BOLD}${PURPLE}Controllo aggiornamenti dello script...${RESET}"
-{
-    sudo curl -fsSL https://raw.githubusercontent.com/RootGPT-YouTube/DebBasedUP/main/aggiorna -o /tmp/aggiorna.tmp && \
-    sudo mv /tmp/aggiorna.tmp /usr/local/bin/aggiorna && sudo chmod a+x /usr/local/bin/aggiorna
-    log_success "Verifica aggiornamenti script"
-} 2>/dev/null
-
-#== Ultimo messaggio ==
-echo -e "${BOLD}${PURPLE}✔ Script terminato. Premere un tasto per continuare...${RESET}"
-read
+#== Resoconto + chiusura ======================================================
+report_card
+printf '\e[?25h'
+read -r -p "$(printf '   %s↵ Premi INVIO per chiudere%s' "$DIM" "$RESET")"
 # == Termine dello script ==
