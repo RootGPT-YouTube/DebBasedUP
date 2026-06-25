@@ -1,30 +1,55 @@
 #!/bin/bash
 #
-# Aggiorna 3.4 — manutenzione e aggiornamento di distro basate su Debian
-# by R∞tGPT — interfaccia originale "pipeline" (nessuna parentela con Nala)
+# aggiorna — Debian-based maintenance & update helper
+# by R∞tGPT — original "pipeline" interface (unrelated to Nala)
+#
+# Engine: apt-get driven through the APT::Status-Fd machine interface, so the
+# download/install progress is parsed from a stable frontend protocol instead
+# of scraping human-readable text.
 #
 
-#== Colori (ESC reali, così funzionano sia con printf che con echo) ==
+#== Colors (real ESC, so they work both with printf and echo) ================
 RESET=$'\e[0m'
 BOLD=$'\e[1m'
-DIM=$'\e[38;2;96;106;128m'      # grigio-ardesia per le linee
+DIM=$'\e[38;2;96;106;128m'      # slate-grey for the rules
 GREEN=$'\e[38;2;80;220;130m'
 RED=$'\e[38;2;255;95;95m'
 CYAN=$'\e[38;2;0;220;210m'
 GOLD=$'\e[38;2;255;200;90m'
 
-#== Stato globale ==
+#== Global state =============================================================
 steps_ok=0
 steps_fail=0
 SCRIPT_UPDATE='—'
 FIRST_STEP=1
 
-#== Utilità ==================================================================
+# Overall progress is measured in milli-packages (1 package = 1000 units), so a
+# section can contribute fractional progress while the whole transaction is
+# resolved up-front during planning — the TOTAL bar denominator never rescales.
+G_TOTAL_PKG=0    # total packages across every section (Cromite excluded)
+G_DONE_MU=0      # completed milli-packages from already-finished sections
 
-# ripete un carattere (anche multibyte) n volte
+# Pre-resolved plan (filled by plan_phase)
+APT_UPG=0
+APT_REM=0
+FU_REFS=()       # Flatpak refs to update
+FX_REFS=()       # unused Flatpak refs to remove
+
+# Live block bookkeeping
+LIVE_DRAWN=0
+LIVE_LINES=3
+SPIN=('◜' '◠' '◝' '◞' '◡' '◟')   # rotating arc (not braille!)
+
+# Terminal geometry for the fixed TOTAL footer (bottom 2 reserved rows)
+TERM_ROWS=24
+TERM_COLS=80
+
+#== Utilities ================================================================
+
+# repeat a (possibly multibyte) character n times
 rep() { local n=$1 ch=$2 i; for ((i=0; i<n; i++)); do printf '%s' "$ch"; done; }
 
-# scrive del testo applicando un gradiente truecolor da (r1,g1,b1) a (r2,g2,b2)
+# write text applying a truecolor gradient from (r1,g1,b1) to (r2,g2,b2)
 grad_text() {
     local text="$1" r1=$2 g1=$3 b1=$4 r2=$5 g2=$6 b2=$7
     local len=${#text} i r g b den
@@ -49,11 +74,28 @@ kb_to_human() {
     fi
 }
 
-#== Header a gradiente ========================================================
+# truncate a string to n columns, appending an ellipsis when it was cut
+trunc() {
+    local s=$1 n=$2
+    if (( ${#s} > n )); then printf '%s…' "${s:0:n-1}"; else printf '%s' "$s"; fi
+}
+
+# percentage done/total (0 when total is unknown)
+pct() { local d=$1 t=$2; (( t <= 0 )) && { printf '0'; return; }; printf '%d' $(( d * 100 / t )); }
+
+# a [██████░░░░] progress bar of the given width
+draw_bar() {
+    local d=$1 t=$2 w=$3 fill
+    if (( t <= 0 )); then fill=0; else fill=$(( d * w / t )); fi
+    (( fill > w )) && fill=$w; (( fill < 0 )) && fill=0
+    printf '%s[%s%s%s%s%s]%s' \
+        "$DIM" "$CYAN" "$(rep $fill '█')" "$DIM" "$(rep $(( w - fill )) '─')" "$DIM" "$RESET"
+}
+
+#== Gradient header ==========================================================
 header() {
-    local cols width
-    cols=$(tput cols 2>/dev/null || echo 56)
-    width=$(( cols < 56 ? cols : 56 ))
+    local width
+    width=$(( TERM_COLS < 56 ? TERM_COLS : 56 ))
     (( width < 24 )) && width=24
     local bar; bar=$(rep $(( width - 4 )) '━')
 
@@ -61,49 +103,309 @@ header() {
     printf '  '; grad_text "$bar" 60 110 200 0 220 210; echo
     printf '   '; grad_text "A G G I O R N A" 70 130 230 0 220 200
     printf '    %s•%s  ' "$DIM" "$RESET"; grad_text "R∞tGPT" 0 220 200 180 90 255
-    printf '   %sv3.4%s' "$DIM" "$RESET"; echo
+    printf '   %sv4.0%s' "$DIM" "$RESET"; echo
     printf '  '; grad_text "$bar" 0 220 210 60 110 200; echo
     echo
 }
 
-#== Esecuzione di uno step della pipeline =====================================
-# run_step "Etichetta" comando args...
+#== Fixed TOTAL footer (reserved bottom rows, outside the scroll region) ======
+setup_footer() {
+    TERM_ROWS=$(tput lines 2>/dev/null || echo 24)
+    TERM_COLS=$(tput cols  2>/dev/null || echo 80)
+    (( TERM_ROWS < 8 )) && TERM_ROWS=8
+    printf '\e[1;%dr' $(( TERM_ROWS - 2 ))     # scroll region: rows 1 .. ROWS-2
+    printf '\e[1;1H'                           # cursor back to the top
+    draw_total_footer 0
+}
+
+teardown_footer() {
+    printf '\e7'                               # save the content cursor
+    printf '\e[%d;1H\e[K' $(( TERM_ROWS - 1 )) # clear the rule row
+    printf '\e[%d;1H\e[K' "$TERM_ROWS"         # clear the bar row
+    printf '\e[r'                              # restore full scroll region
+    printf '\e8'                               # back to the content cursor
+}
+
+# redraw the pinned TOTAL bar; argument = completed milli-packages (incl. the
+# in-progress section). Uses absolute positioning + save/restore so it never
+# disturbs the scrolling pipeline above it.
+draw_total_footer() {
+    local dmu=$1 tmu=$(( G_TOTAL_PKG * 1000 ))
+    local w=$(( TERM_COLS - 34 )); (( w > 40 )) && w=40; (( w < 8 )) && w=8
+    printf '\e7'
+    printf '\e[%d;1H%s%s%s\e[K' $(( TERM_ROWS - 1 )) "$DIM" "$(rep $(( TERM_COLS > 2 ? TERM_COLS - 2 : 1 )) '─')" "$RESET"
+    printf '\e[%d;1H' "$TERM_ROWS"
+    printf '   %sTOTAL%s  %s  %s%3s%%%s   %s%d packages%s\e[K' \
+        "$BOLD" "$RESET" "$(draw_bar "$dmu" "$tmu" "$w")" \
+        "$BOLD" "$(pct "$dmu" "$tmu")" "$RESET" \
+        "$DIM" "$G_TOTAL_PKG" "$RESET"
+    printf '\e8'
+}
+
+#== Pipeline drawing =========================================================
+
+# vertical connector between two pipeline nodes
+connector() {
+    if (( FIRST_STEP )); then FIRST_STEP=0; else printf '   %s┃%s\n' "$DIM" "$RESET"; fi
+}
+
+# redraw the live 3-line block (spinner node + counter + section bar);
+# sd/st are the section progress as done/total of any matching scale
+render_live() {
+    local spin=$1 label=$2 el=$3 counter=$4 sd=$5 st=$6
+    (( LIVE_DRAWN )) && printf '\e[%dA' "$LIVE_LINES"
+    LIVE_DRAWN=1
+    printf '\r   %s%s%s  %s   %s%s%s\e[K\n' "$CYAN" "$spin" "$RESET" "$label" "$DIM" "$el" "$RESET"
+    printf '\r      %s%s%s\e[K\n' "$DIM" "$counter" "$RESET"
+    printf '\r      %ssection%s %s %s%3s%%%s\e[K\n' "$DIM" "$RESET" "$(draw_bar "$sd" "$st" 22)" "$DIM" "$(pct "$sd" "$st")" "$RESET"
+}
+
+# collapse the live block into a single result node line
+finish_node() {
+    local sym=$1 color=$2 label=$3
+    (( LIVE_DRAWN )) && printf '\e[%dA' "$LIVE_LINES"
+    printf '\r   %s%s%s  %s\e[K\n' "$color" "$sym" "$RESET" "$label"
+    (( LIVE_DRAWN )) && printf '\e[J'
+    LIVE_DRAWN=0
+}
+
+# error box with the tail of the command log
+error_box() {
+    local log=$1
+    printf '   %s┃%s\n' "$DIM" "$RESET"
+    printf '   %s┗━ error detail ─────────────────────────────%s\n' "$RED" "$RESET"
+    tail -n 8 "$log" | sed "s/^/      ${DIM}│${RESET} /"
+    printf '   %s──────────────────────────────────────────────%s\n' "$RED" "$RESET"
+}
+
+#== Plain spinner step (no per-package progress: e.g. cromup) =================
 run_step() {
     local label="$1"; shift
     local log; log=$(mktemp)
-    local frames=('◜' '◠' '◝' '◞' '◡' '◟')   # arco rotante (non braille!)
-
-    # connettore verticale tra un nodo e l'altro
-    if (( FIRST_STEP )); then FIRST_STEP=0; else printf '   %s┃%s\n' "$DIM" "$RESET"; fi
-
+    connector
     "$@" >"$log" 2>&1 &
-    local pid=$! start=$SECONDS i=0
+    local pid=$! i=0 start=$SECONDS
     while kill -0 "$pid" 2>/dev/null; do
-        local f="${frames[$(( i % 6 ))]}"
         printf '\r   %s%s%s  %s   %s%s%s\e[K' \
-            "$CYAN" "$f" "$RESET" "$label" "$DIM" "$(fmt_time $(( SECONDS - start )))" "$RESET"
-        i=$(( i + 1 ))
-        sleep 0.12
+            "$CYAN" "${SPIN[i%6]}" "$RESET" "$label" "$DIM" "$(fmt_time $(( SECONDS - start )))" "$RESET"
+        i=$(( i + 1 )); sleep 0.12
     done
     wait "$pid"; local rc=$?
-
     if (( rc == 0 )); then
         printf '\r   %s●%s  %s\e[K\n' "$GREEN" "$RESET" "$label"
         steps_ok=$(( steps_ok + 1 ))
     else
         printf '\r   %s✗%s  %s%s%s\e[K\n' "$RED" "$RESET" "$RED" "$label" "$RESET"
         steps_fail=$(( steps_fail + 1 ))
-        # in caso di errore mostra le ultime righe del log in un riquadro
-        printf '   %s┃%s\n' "$DIM" "$RESET"
-        printf '   %s┗━ dettaglio errore ─────────────────────────%s\n' "$RED" "$RESET"
-        tail -n 8 "$log" | sed "s/^/      ${DIM}│${RESET} /"
-        printf '   %s──────────────────────────────────────────────%s\n' "$RED" "$RESET"
+        error_box "$log"
     fi
     rm -f "$log"
-    return "$rc"
 }
 
-#== Scheda di resoconto =======================================================
+#== Planning: resolve every section up-front so the TOTAL is known ============
+
+# sum a field from an "apt-get -s" summary line, e.g.
+#   "1 upgraded, 1 newly installed, 0 to remove and 0 not upgraded."
+# field=install -> upgraded + newly installed ; field=remove -> to remove
+apt_count() {
+    local field="$1"; shift
+    "$@" 2>/dev/null | awk -v f="$field" '
+        / upgraded/ && /installed/ {
+            gsub(/[,.]/, "")
+            for (i = 1; i <= NF; i++) {
+                if ($i == "upgraded" && up == "") up = $(i-1)
+                else if ($i == "newly")          ni = $(i-1)
+                else if ($i == "to")             rm = $(i-1)
+            }
+        }
+        END { if (f == "install") print up + ni + 0; else print rm + 0 }'
+}
+
+# list Flatpak refs needing an update (mode=update) or that are unused (mode=unused)
+flatpak_refs() {
+    if [[ $1 == update ]]; then
+        env LC_ALL=C flatpak update --no-deploy 2>/dev/null
+    else
+        printf 'n\n' | env LC_ALL=C flatpak uninstall --unused 2>/dev/null
+    fi | awk -F'\t' '/^[[:space:]]*[0-9]+\./ { gsub(/^[ \t]+|[ \t]+$/,"",$3); if ($3!="") print $3 }'
+}
+
+plan_phase() {
+    connector
+    local tmp; tmp=$(mktemp)
+    (
+        # one metadata refresh; the upgrade below reuses these lists
+        sudo env LC_ALL=C apt-get update >/dev/null 2>&1
+        upg=$(apt_count install sudo env LC_ALL=C apt-get -s full-upgrade)
+        rem=$(apt_count remove  sudo env LC_ALL=C apt-get -s autoremove)
+        mapfile -t fu < <(flatpak_refs update)
+        mapfile -t fx < <(flatpak_refs unused)
+        {
+            printf 'P_UPG=%d\n'  "${upg:-0}"
+            printf 'P_REM=%d\n'  "${rem:-0}"
+            printf 'FU=%s\n' "$(printf '%s\n' "${fu[@]}")"
+            printf '__FUEND__\n'
+            printf 'FX=%s\n' "$(printf '%s\n' "${fx[@]}")"
+            printf '__FXEND__\n'
+        } > "$tmp"
+    ) &
+    local pid=$! i=0 start=$SECONDS
+    while kill -0 "$pid" 2>/dev/null; do
+        printf '\r   %s%s%s  %s   %s%s%s\e[K' \
+            "$CYAN" "${SPIN[i%6]}" "$RESET" "Planning updates" "$DIM" "$(fmt_time $(( SECONDS - start )))" "$RESET"
+        i=$(( i + 1 )); sleep 0.12
+    done
+    wait "$pid"
+
+    # parse the plan
+    APT_UPG=$(sed -n 's/^P_UPG=//p' "$tmp"); APT_UPG=${APT_UPG:-0}
+    APT_REM=$(sed -n 's/^P_REM=//p' "$tmp"); APT_REM=${APT_REM:-0}
+    mapfile -t FU_REFS < <(sed -n '/^FU=/,/^__FUEND__$/p' "$tmp" | sed '1s/^FU=//; /^__FUEND__$/d; /^$/d')
+    mapfile -t FX_REFS < <(sed -n '/^FX=/,/^__FXEND__$/p' "$tmp" | sed '1s/^FX=//; /^__FXEND__$/d; /^$/d')
+    rm -f "$tmp"
+
+    G_TOTAL_PKG=$(( APT_UPG + APT_REM + ${#FU_REFS[@]} + ${#FX_REFS[@]} ))
+    draw_total_footer 0
+    printf '\r   %s●%s  Planning complete  %s(%d package(s) to process)%s\e[K\n' \
+        "$GREEN" "$RESET" "$DIM" "$G_TOTAL_PKG" "$RESET"
+}
+
+#== APT step with download + transaction progress ============================
+# run_apt "Label" "Install|Remove" pkgcount sudo env ... apt-get -y <cmd>
+#
+# We append APT::Status-Fd=1 so apt writes machine-readable status lines
+#   dlstatus:<id>:<pct>:<msg>      (overall download percentage)
+#   pmstatus:<pkg>:<pct>:<msg>     (overall install percentage)
+# onto stdout, interleaved with its normal text. The status lines drive the
+# bars; everything else is funnelled to the log for the error box. Status goes
+# to fd 1 (not a higher fd) because sudo closes inherited descriptors >= 3.
+run_apt() {
+    local label="$1" p2="$2" pkg="$3"; shift 3
+    local log; log=$(mktemp)
+    connector
+
+    if (( pkg == 0 )); then
+        render_live "${SPIN[0]}" "$label" '00:00' 'nothing to do' 1 1
+        draw_total_footer "$G_DONE_MU"
+        finish_node '●' "$GREEN" "$label"; steps_ok=$(( steps_ok + 1 )); rm -f "$log"; return
+    fi
+
+    local dl_pct=0 in_pct=0 saw_dl=0 installing=0
+    local counter='resolving…' inname='' dlname=''
+    local start=$SECONDS i=0 rc=-1 fd
+    exec {fd}< <( { "$@" -o APT::Status-Fd=1 2>>"$log"; printf '\n__RC__%d__\n' "$?"; } )
+
+    render_live "${SPIN[0]}" "$label" '00:00' "$counter" 0 1
+    draw_total_footer "$G_DONE_MU"
+
+    while true; do
+        if IFS= read -t 0.12 -r -u "$fd" line; then
+            case "$line" in
+                __RC__*__)
+                    rc=${line#__RC__}; rc=${rc%__}; continue
+                    ;;
+                dlstatus:*)
+                    local rest=${line#dlstatus:}; rest=${rest#*:}   # drop the id
+                    local p=${rest%%:*} msg=${rest#*:}
+                    p=${p%%.*}; saw_dl=1; dl_pct=${p:-0}
+                    dlname=$(trunc "$msg" 42)
+                    counter="Downloading ${dl_pct}%  ${dlname}"
+                    ;;
+                pmstatus:*)
+                    local rest=${line#pmstatus:}
+                    local pk=${rest%%:*}; rest=${rest#*:}
+                    local p=${rest%%:*} msg=${rest#*:}
+                    p=${p%%.*}; installing=1; in_pct=${p:-0}
+                    [[ $pk == dpkg* || -z $pk ]] || inname=$pk
+                    counter="$p2 ${in_pct}%  ${inname:-$(trunc "$msg" 42)}"
+                    ;;
+                *)
+                    printf '%s\n' "$line" >>"$log"
+                    ;;
+            esac
+        else
+            (( $? > 128 )) || break
+        fi
+        # section completion as a per-mille fraction: download is the first
+        # half, install the second; if nothing is downloaded (all cached) the
+        # install drives the whole bar so it never starts pinned at 50%.
+        local f=0
+        if (( installing )); then
+            if (( saw_dl )); then f=$(( 500 + in_pct * 5 )); else f=$(( in_pct * 10 )); fi
+        else
+            f=$(( dl_pct * 5 ))
+        fi
+        (( f > 1000 )) && f=1000
+        render_live "${SPIN[i%6]}" "$label" "$(fmt_time $(( SECONDS - start )))" "$counter" "$f" 1000
+        draw_total_footer $(( G_DONE_MU + f * pkg ))
+        i=$(( i + 1 ))
+    done
+    exec {fd}<&-
+
+    G_DONE_MU=$(( G_DONE_MU + pkg * 1000 ))
+    draw_total_footer "$G_DONE_MU"
+    if (( rc == 0 )); then
+        finish_node '●' "$GREEN" "$label"; steps_ok=$(( steps_ok + 1 ))
+    else
+        finish_node '✗' "$RED" "$label"; steps_fail=$(( steps_fail + 1 )); error_box "$log"
+    fi
+    rm -f "$log"
+}
+
+#== Flatpak section: update or remove one ref at a time ======================
+# run_flatpak "Label" update|remove ref...
+run_flatpak() {
+    local label="$1" mode="$2"; shift 2
+    local refs=("$@") N=$#
+    local log; log=$(mktemp)
+    connector
+
+    local verb; [[ $mode == update ]] && verb=Update || verb=Remove
+
+    if (( N == 0 )); then
+        render_live "${SPIN[0]}" "$label" '00:00' 'nothing to do' 1 1
+        draw_total_footer "$G_DONE_MU"
+        finish_node '●' "$GREEN" "$label"; steps_ok=$(( steps_ok + 1 )); rm -f "$log"; return
+    fi
+
+    local rc=0 start=$SECONDS i=0 idx=0 ref
+    for ref in "${refs[@]}"; do
+        idx=$(( idx + 1 ))
+        local cur_pct=0 lrc=0 fd
+        if [[ $mode == update ]]; then
+            exec {fd}< <( { env LC_ALL=C flatpak update -y "$ref"; printf '\n__RC__%d__\n' "$?"; } 2>&1 )
+        else
+            exec {fd}< <( { env LC_ALL=C flatpak uninstall -y "$ref"; printf '\n__RC__%d__\n' "$?"; } 2>&1 )
+        fi
+        while true; do
+            if IFS= read -t 0.12 -r -u "$fd" line; then
+                case "$line" in __RC__*__) lrc=${line#__RC__}; lrc=${lrc%__}; continue;; esac
+                printf '%s\n' "$line" >>"$log"
+                [[ $line =~ ([0-9]+)%[^0-9]*$ ]] && cur_pct=${BASH_REMATCH[1]}
+            else
+                (( $? > 128 )) || break
+            fi
+            local sd=$(( (idx - 1) * 1000 + cur_pct * 10 ))
+            render_live "${SPIN[i%6]}" "$label" "$(fmt_time $(( SECONDS - start )))" \
+                "$verb $idx/$N: $ref" "$sd" "$(( N * 1000 ))"
+            draw_total_footer $(( G_DONE_MU + sd ))
+            i=$(( i + 1 ))
+        done
+        exec {fd}<&-
+        (( lrc != 0 )) && rc=1
+    done
+
+    G_DONE_MU=$(( G_DONE_MU + N * 1000 ))
+    draw_total_footer "$G_DONE_MU"
+    if (( rc == 0 )); then
+        finish_node '●' "$GREEN" "$label"; steps_ok=$(( steps_ok + 1 ))
+    else
+        finish_node '✗' "$RED" "$label"; steps_fail=$(( steps_fail + 1 )); error_box "$log"
+    fi
+    rm -f "$log"
+}
+
+#== Report card =============================================================
 card_line() {
     local label="$1" value="$2" vcolor="$3"
     local inner=46
@@ -117,7 +419,7 @@ card_line() {
 report_card() {
     local inner=46
     local rule; rule=$(rep "$inner" '─')
-    local title='R E S O C O N T O'
+    local title='R E P O R T'
     local tpad=$(( (inner - ${#title}) / 2 ))
 
     echo
@@ -128,85 +430,87 @@ report_card() {
     printf '  %s├%s┤%s\n' "$CYAN" "$rule" "$RESET"
 
     local ok_color="$GREEN"; (( steps_fail > 0 )) && ok_color="$GOLD"
-    card_line "Operazioni riuscite" "${steps_ok}/$(( steps_ok + steps_fail ))" "$ok_color$BOLD"
-    card_line "Tempo impiegato"     "$(fmt_time "$SECONDS")"                    "$BOLD"
+    card_line "Operations succeeded" "${steps_ok}/$(( steps_ok + steps_fail ))" "$ok_color$BOLD"
+    card_line "Packages processed"   "${G_TOTAL_PKG}"                            "$BOLD"
+    card_line "Time elapsed"         "$(fmt_time "$SECONDS")"                     "$BOLD"
     local freed=$(( END_AVAIL - START_AVAIL ))
     if (( freed >= 0 )); then
-        card_line "Spazio liberato"  "$(kb_to_human "$freed")"   "$GREEN$BOLD"
+        card_line "Space freed"  "$(kb_to_human "$freed")"   "$GREEN$BOLD"
     else
-        card_line "Spazio occupato"  "$(kb_to_human "$(( -freed ))")" "$GOLD$BOLD"
+        card_line "Space used"   "$(kb_to_human "$(( -freed ))")" "$GOLD$BOLD"
     fi
-    card_line "Aggiornamento script" "$SCRIPT_UPDATE"            "$BOLD"
+    card_line "Script update" "$SCRIPT_UPDATE"            "$BOLD"
 
     printf '  %s╰%s╯%s\n' "$CYAN" "$rule" "$RESET"
     echo
 }
 
-#== Pulizia finale: ripristina il cursore e ferma il keep-alive sudo ==========
+#== Cleanup: reset the scroll region, restore the cursor, stop sudo keep-alive =
 cleanup() {
-    printf '\e[?25h'                                   # mostra di nuovo il cursore
+    printf '\e[r'                                      # reset the scroll region
+    printf '\e[?25h'                                   # show the cursor again
     [ -n "${SUDO_PID:-}" ] && kill "$SUDO_PID" 2>/dev/null
 }
 trap cleanup EXIT INT TERM
 
-#== AVVIO =====================================================================
+#== START ===================================================================
 clear
+setup_footer
 header
 
-# Credenziali root + keep-alive (gli step girano in background con output nascosto,
-# quindi sudo non deve mai fermarsi a chiedere la password a metà corsa)
-printf '   %s🔑 Autenticazione amministratore richiesta...%s\n\n' "$GOLD" "$RESET"
+# Root credentials + keep-alive (steps read package-manager output through a
+# pipe, so sudo must never stop to ask for the password mid-run)
+printf '   %s🔑 Administrator authentication required...%s\n\n' "$GOLD" "$RESET"
 if ! sudo -v; then
-    printf '   %s✗ Autenticazione fallita. Uscita.%s\n' "$RED" "$RESET"
+    printf '   %s✗ Authentication failed. Exiting.%s\n' "$RED" "$RESET"
     exit 1
 fi
 ( while true; do sudo -n true; sleep 50; kill -0 "$$" 2>/dev/null || exit; done ) 2>/dev/null &
 SUDO_PID=$!
 
-printf '\e[?25l'                                        # nasconde il cursore
+printf '\e[?25l'                                        # hide the cursor
 START_AVAIL=$(df --output=avail / | tail -1 | tr -d ' ')
 
-# Dipendenza: Nala (installata al volo se assente)
-if ! command -v nala >/dev/null 2>&1; then
-    run_step "Installazione di Nala (dipendenza)" bash -c 'sudo apt update && sudo apt install -y nala'
-    if ! command -v nala >/dev/null 2>&1; then
-        printf '\e[?25h'
-        printf '   %s✗ Impossibile installare Nala. Lo script termina.%s\n' "$RED" "$RESET"
-        exit 1
-    fi
-fi
+# Resolve everything first (one metadata refresh), so the TOTAL bar is exact.
+plan_phase
 
-run_step "Aggiornamento del sistema (Nala)"   sudo nala upgrade --update --full -y
-run_step "Rimozione dei pacchetti orfani"     sudo nala autoremove -y
-run_step "Aggiornamento delle Flatpak"        flatpak update -y
-run_step "Pulizia delle Flatpak inutilizzate" flatpak uninstall --unused -y
+# The upgrade reuses the lists just refreshed during planning (no second update).
+# DEBIAN_FRONTEND=noninteractive keeps dpkg from stopping on conffile prompts.
+run_apt      "System upgrade (APT)"        "Install" "$APT_UPG" \
+    sudo env LC_ALL=C DEBIAN_FRONTEND=noninteractive apt-get -y -q -o Dpkg::Use-Pty=0 full-upgrade
+run_apt      "Removing orphaned packages"  "Remove"  "$APT_REM" \
+    sudo env LC_ALL=C DEBIAN_FRONTEND=noninteractive apt-get -y -q -o Dpkg::Use-Pty=0 autoremove
+run_flatpak  "Updating Flatpaks"           update "${FU_REFS[@]}"
+run_flatpak  "Removing unused Flatpaks"    remove "${FX_REFS[@]}"
 
-# Hook opzionale: cromup
+# Optional hook: cromup (Cromite) — excluded from the overall progress bar
 if [ -x /usr/local/bin/cromup ]; then
-    run_step "Aggiornamento Cromite (cromup)" cromup
+    run_step "Updating Cromite (cromup)" cromup
 fi
 
 END_AVAIL=$(df --output=avail / | tail -1 | tr -d ' ')
+teardown_footer
 
-#== Autoaggiornamento dello script ============================================
+#== Script self-update ======================================================
 if curl -fsSL https://raw.githubusercontent.com/RootGPT-YouTube/DebBasedUP/main/aggiorna -o /tmp/aggiorna.tmp 2>/dev/null; then
     if ! cmp -s /tmp/aggiorna.tmp /usr/local/bin/aggiorna 2>/dev/null; then
         if sudo mv /tmp/aggiorna.tmp /usr/local/bin/aggiorna && sudo chmod a+x /usr/local/bin/aggiorna; then
-            SCRIPT_UPDATE='aggiornato ✓'
+            SCRIPT_UPDATE='updated ✓'
         else
-            SCRIPT_UPDATE='errore ✗'
+            SCRIPT_UPDATE='error ✗'
         fi
     else
-        SCRIPT_UPDATE='già aggiornato'
+        SCRIPT_UPDATE='already up to date'
         rm -f /tmp/aggiorna.tmp
     fi
 else
     rm -f /tmp/aggiorna.tmp
-    SCRIPT_UPDATE='non verificato'
+    SCRIPT_UPDATE='not checked'
 fi
 
-#== Resoconto + chiusura ======================================================
+#== Report + exit ===========================================================
 report_card
 printf '\e[?25h'
-read -r -p "$(printf '   %s↵ Premi INVIO per chiudere%s' "$DIM" "$RESET")"
-# == Termine dello script ==
+read -r -p "$(printf '   %s↵ Press ENTER to close%s' "$DIM" "$RESET")"
+clear
+# == End of script ==
