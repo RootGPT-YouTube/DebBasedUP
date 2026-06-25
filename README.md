@@ -12,6 +12,4 @@ Adesso avrai un comando nuovo nel terminale - `aggiorna` - che quando lo lancera
 - **Output pulito**: l'output dei comandi è nascosto durante l'esecuzione e mostrato in un riquadro **solo in caso di errore**.
 - **Scheda di resoconto** finale con operazioni riuscite, tempo impiegato, spazio liberato su disco ed esito dell'autoaggiornamento dello script.
 
-Operazioni eseguite: installazione di **Nala** se assente, `nala upgrade --update --full`, `nala autoremove`, `flatpak update`, `flatpak uninstall --unused`, l'hook opzionale `cromup` (se presente) e l'autoaggiornamento dello script stesso.
-
-Questo script usa Nala (https://gitlab.com/volian/nala) (GPLv3) come frontend di APT, installandolo dai repository della distro se non presente.
+Operazioni eseguite: `apt-get update`, `apt-get full-upgrade`, `apt-get autoremove`, `flatpak update`, `flatpak uninstall --unused`, l'hook opzionale `cromup` (se presente) e l'autoaggiornamento dello script stesso.
