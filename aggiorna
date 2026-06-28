@@ -23,17 +23,25 @@ steps_fail=0
 SCRIPT_UPDATE='—'
 FIRST_STEP=1
 
-# Overall progress is measured in milli-packages (1 package = 1000 units), so a
-# section can contribute fractional progress while the whole transaction is
-# resolved up-front during planning — the TOTAL bar denominator never rescales.
-G_TOTAL_PKG=0    # total packages across every section (Cromite excluded)
-G_DONE_MU=0      # completed milli-packages from already-finished sections
+# The TOTAL bar runs on a fixed 0..1000 per-mille scale split into three phase
+# bands — download / install / flatpak — weighted 30/40/30 of the whole bar
+# (planned up-front in plan_phase). A phase with no work has its weight handed
+# to the phases that do, so the bar always spans a full 0→100% with no stalls.
+G_TOTAL_PKG=0    # total packages across every section (Cromite excluded) — label only
 
 # Pre-resolved plan (filled by plan_phase)
 APT_UPG=0
 APT_REM=0
 FU_REFS=()       # Flatpak refs to update
 FX_REFS=()       # unused Flatpak refs to remove
+
+# Per-mille band boundaries on the TOTAL bar (filled by plan_phase). Each section
+# fills its [lo,hi] slice; boundaries are contiguous so the bar never jumps back.
+B_DLU_HI=300     # download (APT full-upgrade): 0 .. B_DLU_HI
+B_INU_HI=500     # install, upgrade share:      B_DLU_HI .. B_INU_HI
+B_INA_HI=700     # install, autoremove:         B_INU_HI .. B_INA_HI
+B_FPU_HI=850     # flatpak update share:        B_INA_HI .. B_FPU_HI
+                 # flatpak remove share:        B_FPU_HI .. 1000
 
 # Live block bookkeeping
 LIVE_DRAWN=0
@@ -126,18 +134,19 @@ teardown_footer() {
     printf '\e8'                               # back to the content cursor
 }
 
-# redraw the pinned TOTAL bar; argument = completed milli-packages (incl. the
-# in-progress section). Uses absolute positioning + save/restore so it never
-# disturbs the scrolling pipeline above it.
+# redraw the pinned TOTAL bar; argument = overall progress in per-mille (0..1000)
+# on the fixed phase-band scale. Uses absolute positioning + save/restore so it
+# never disturbs the scrolling pipeline above it.
 draw_total_footer() {
-    local dmu=$1 tmu=$(( G_TOTAL_PKG * 1000 ))
+    local pm=$1
+    (( pm < 0 )) && pm=0; (( pm > 1000 )) && pm=1000
     local w=$(( TERM_COLS - 34 )); (( w > 40 )) && w=40; (( w < 8 )) && w=8
     printf '\e7'
     printf '\e[%d;1H%s%s%s\e[K' $(( TERM_ROWS - 1 )) "$DIM" "$(rep $(( TERM_COLS > 2 ? TERM_COLS - 2 : 1 )) '─')" "$RESET"
     printf '\e[%d;1H' "$TERM_ROWS"
     printf '   %sTOTAL%s  %s  %s%3s%%%s   %s%d packages%s\e[K' \
-        "$BOLD" "$RESET" "$(draw_bar "$dmu" "$tmu" "$w")" \
-        "$BOLD" "$(pct "$dmu" "$tmu")" "$RESET" \
+        "$BOLD" "$RESET" "$(draw_bar "$pm" 1000 "$w")" \
+        "$BOLD" "$(pct "$pm" 1000)" "$RESET" \
         "$DIM" "$G_TOTAL_PKG" "$RESET"
     printf '\e8'
 }
@@ -264,14 +273,39 @@ plan_phase() {
     mapfile -t FX_REFS < <(sed -n '/^FX=/,/^__FXEND__$/p' "$tmp" | sed '1s/^FX=//; /^__FXEND__$/d; /^$/d')
     rm -f "$tmp"
 
-    G_TOTAL_PKG=$(( APT_UPG + APT_REM + ${#FU_REFS[@]} + ${#FX_REFS[@]} ))
+    local nfu=${#FU_REFS[@]} nfx=${#FX_REFS[@]}
+    G_TOTAL_PKG=$(( APT_UPG + APT_REM + nfu + nfx ))
+
+    # Carve the 0..1000 bar into download / install / flatpak bands, weighted
+    # 30/40/30 — but a phase with no work hands its weight to the others, so the
+    # present phases always stretch to fill the whole bar.
+    local in_tot=$(( APT_UPG + APT_REM )) fp_tot=$(( nfu + nfx ))
+    local wdl=0 win=0 wfp=0
+    (( APT_UPG > 0 )) && wdl=30
+    (( in_tot  > 0 )) && win=40
+    (( fp_tot  > 0 )) && wfp=30
+    local w=$(( wdl + win + wfp )); (( w == 0 )) && w=1
+
+    B_DLU_HI=$(( 1000 * wdl / w ))                         # end of download band
+    local in_lo=$B_DLU_HI in_span=$(( 1000 * win / w ))
+    local in_hi=$(( in_lo + in_span ))
+    # split the install band between upgrade and autoremove by package count
+    B_INU_HI=$(( in_tot > 0 ? in_lo + in_span * APT_UPG / in_tot : in_lo ))
+    B_INA_HI=$in_hi
+    # the flatpak band is everything left up to 1000, split update vs remove
+    local fp_lo=$in_hi
+    B_FPU_HI=$(( fp_tot > 0 ? fp_lo + (1000 - fp_lo) * nfu / fp_tot : fp_lo ))
+
     draw_total_footer 0
     printf '\r   %s●%s  Planning complete  %s(%d package(s) to process)%s\e[K\n' \
         "$GREEN" "$RESET" "$DIM" "$G_TOTAL_PKG" "$RESET"
 }
 
 #== APT step with download + transaction progress ============================
-# run_apt "Label" "Install|Remove" pkgcount sudo env ... apt-get -y <cmd>
+# run_apt "Label" "Install|Remove" pkgcount dl_lo dl_hi in_lo in_hi sudo env ... apt-get -y <cmd>
+#
+# The download phase fills the TOTAL bar's [dl_lo,dl_hi] band, the transaction
+# fills [in_lo,in_hi]; dl_lo==dl_hi means "this step never downloads".
 #
 # We append APT::Status-Fd=1 so apt writes machine-readable status lines
 #   dlstatus:<id>:<pct>:<msg>      (overall download percentage)
@@ -280,13 +314,13 @@ plan_phase() {
 # bars; everything else is funnelled to the log for the error box. Status goes
 # to fd 1 (not a higher fd) because sudo closes inherited descriptors >= 3.
 run_apt() {
-    local label="$1" p2="$2" pkg="$3"; shift 3
+    local label="$1" p2="$2" pkg="$3" dl_lo="$4" dl_hi="$5" in_lo="$6" in_hi="$7"; shift 7
     local log; log=$(mktemp)
     connector
 
     if (( pkg == 0 )); then
         render_live "${SPIN[0]}" "$label" '00:00' 'nothing to do' 1 1
-        draw_total_footer "$G_DONE_MU"
+        draw_total_footer "$in_hi"
         finish_node '●' "$GREEN" "$label"; steps_ok=$(( steps_ok + 1 )); rm -f "$log"; return
     fi
 
@@ -296,7 +330,7 @@ run_apt() {
     exec {fd}< <( { "$@" -o APT::Status-Fd=1 2>>"$log"; printf '\n__RC__%d__\n' "$?"; } )
 
     render_live "${SPIN[0]}" "$label" '00:00' "$counter" 0 1
-    draw_total_footer "$G_DONE_MU"
+    draw_total_footer "$dl_lo"
 
     while true; do
         if IFS= read -t 0.12 -r -u "$fd" line; then
@@ -326,24 +360,24 @@ run_apt() {
         else
             (( $? > 128 )) || break
         fi
-        # section completion as a per-mille fraction: download is the first
-        # half, install the second; if nothing is downloaded (all cached) the
-        # install drives the whole bar so it never starts pinned at 50%.
-        local f=0
+        # section bar (download = first half, install = second half) and the
+        # absolute TOTAL position within this step's two bands
+        local f=0 pm=$dl_lo
         if (( installing )); then
-            if (( saw_dl )); then f=$(( 500 + in_pct * 5 )); else f=$(( in_pct * 10 )); fi
-        else
+            f=$(( saw_dl ? 500 + in_pct * 5 : in_pct * 10 ))
+            pm=$(( in_lo + (in_hi - in_lo) * in_pct / 100 ))
+        elif (( saw_dl )); then
             f=$(( dl_pct * 5 ))
+            pm=$(( dl_lo + (dl_hi - dl_lo) * dl_pct / 100 ))
         fi
         (( f > 1000 )) && f=1000
         render_live "${SPIN[i%6]}" "$label" "$(fmt_time $(( SECONDS - start )))" "$counter" "$f" 1000
-        draw_total_footer $(( G_DONE_MU + f * pkg ))
+        draw_total_footer "$pm"
         i=$(( i + 1 ))
     done
     exec {fd}<&-
 
-    G_DONE_MU=$(( G_DONE_MU + pkg * 1000 ))
-    draw_total_footer "$G_DONE_MU"
+    draw_total_footer "$in_hi"
     if (( rc == 0 )); then
         finish_node '●' "$GREEN" "$label"; steps_ok=$(( steps_ok + 1 ))
     else
@@ -353,9 +387,10 @@ run_apt() {
 }
 
 #== Flatpak section: update or remove one ref at a time ======================
-# run_flatpak "Label" update|remove ref...
+# run_flatpak "Label" update|remove lo hi ref...
+# Fills the TOTAL bar's [lo,hi] band as the refs complete.
 run_flatpak() {
-    local label="$1" mode="$2"; shift 2
+    local label="$1" mode="$2" lo="$3" hi="$4"; shift 4
     local refs=("$@") N=$#
     local log; log=$(mktemp)
     connector
@@ -364,7 +399,7 @@ run_flatpak() {
 
     if (( N == 0 )); then
         render_live "${SPIN[0]}" "$label" '00:00' 'nothing to do' 1 1
-        draw_total_footer "$G_DONE_MU"
+        draw_total_footer "$hi"
         finish_node '●' "$GREEN" "$label"; steps_ok=$(( steps_ok + 1 )); rm -f "$log"; return
     fi
 
@@ -388,15 +423,14 @@ run_flatpak() {
             local sd=$(( (idx - 1) * 1000 + cur_pct * 10 ))
             render_live "${SPIN[i%6]}" "$label" "$(fmt_time $(( SECONDS - start )))" \
                 "$verb $idx/$N: $ref" "$sd" "$(( N * 1000 ))"
-            draw_total_footer $(( G_DONE_MU + sd ))
+            draw_total_footer $(( lo + (hi - lo) * sd / (N * 1000) ))
             i=$(( i + 1 ))
         done
         exec {fd}<&-
         (( lrc != 0 )) && rc=1
     done
 
-    G_DONE_MU=$(( G_DONE_MU + N * 1000 ))
-    draw_total_footer "$G_DONE_MU"
+    draw_total_footer "$hi"
     if (( rc == 0 )); then
         finish_node '●' "$GREEN" "$label"; steps_ok=$(( steps_ok + 1 ))
     else
@@ -476,12 +510,13 @@ plan_phase
 
 # The upgrade reuses the lists just refreshed during planning (no second update).
 # DEBIAN_FRONTEND=noninteractive keeps dpkg from stopping on conffile prompts.
-run_apt      "System upgrade (APT)"        "Install" "$APT_UPG" \
+# Each step is handed its slice of the TOTAL bar computed in plan_phase.
+run_apt      "System upgrade (APT)"        "Install" "$APT_UPG" 0          "$B_DLU_HI" "$B_DLU_HI" "$B_INU_HI" \
     sudo env LC_ALL=C DEBIAN_FRONTEND=noninteractive apt-get -y -q -o Dpkg::Use-Pty=0 full-upgrade
-run_apt      "Removing orphaned packages"  "Remove"  "$APT_REM" \
+run_apt      "Removing orphaned packages"  "Remove"  "$APT_REM" "$B_INU_HI" "$B_INU_HI" "$B_INU_HI" "$B_INA_HI" \
     sudo env LC_ALL=C DEBIAN_FRONTEND=noninteractive apt-get -y -q -o Dpkg::Use-Pty=0 autoremove
-run_flatpak  "Updating Flatpaks"           update "${FU_REFS[@]}"
-run_flatpak  "Removing unused Flatpaks"    remove "${FX_REFS[@]}"
+run_flatpak  "Updating Flatpaks"           update "$B_INA_HI" "$B_FPU_HI" "${FU_REFS[@]}"
+run_flatpak  "Removing unused Flatpaks"    remove "$B_FPU_HI" 1000         "${FX_REFS[@]}"
 
 # Optional hook: cromup (Cromite) — excluded from the overall progress bar
 if [ -x /usr/local/bin/cromup ]; then
