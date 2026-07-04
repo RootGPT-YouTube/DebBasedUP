@@ -301,6 +301,26 @@ plan_phase() {
         "$GREEN" "$RESET" "$DIM" "$G_TOTAL_PKG" "$RESET"
 }
 
+#== Broken-state auto-repair =================================================
+# When an APT transaction dies half-way (interrupted dpkg, unmet dependencies)
+# the package DB is left "broken": every later apt call refuses to proceed
+# until it is repaired. run_apt detects that state from the command log and,
+# once per step, runs the standard recovery — reconfigure any half-installed
+# packages, then `apt-get --fix-broken install` — before retrying the step in
+# place (no need to re-launch the whole script).
+
+# does the command log look like a broken / interrupted dpkg state?
+apt_looks_broken() {
+    grep -qiE 'fix-broken|dpkg was interrupted|dpkg --configure -a|unmet dependencies|errors were encountered while processing' "$1"
+}
+
+# the recovery command itself (driven as a single step through run_step)
+_do_fix_broken() {
+    sudo env LC_ALL=C DEBIAN_FRONTEND=noninteractive dpkg --configure -a
+    sudo env LC_ALL=C DEBIAN_FRONTEND=noninteractive \
+        apt-get -y -q -o Dpkg::Use-Pty=0 --fix-broken install
+}
+
 #== APT step with download + transaction progress ============================
 # run_apt "Label" "Install|Remove" pkgcount dl_lo dl_hi in_lo in_hi sudo env ... apt-get -y <cmd>
 #
@@ -315,6 +335,7 @@ plan_phase() {
 # to fd 1 (not a higher fd) because sudo closes inherited descriptors >= 3.
 run_apt() {
     local label="$1" p2="$2" pkg="$3" dl_lo="$4" dl_hi="$5" in_lo="$6" in_hi="$7"; shift 7
+    local cmd=("$@")
     local log; log=$(mktemp)
     connector
 
@@ -324,58 +345,77 @@ run_apt() {
         finish_node '●' "$GREEN" "$label"; steps_ok=$(( steps_ok + 1 )); rm -f "$log"; return
     fi
 
-    local dl_pct=0 in_pct=0 saw_dl=0 installing=0
-    local counter='resolving…' inname='' dlname=''
-    local start=$SECONDS i=0 rc=-1 fd
-    exec {fd}< <( { "$@" -o APT::Status-Fd=1 2>>"$log"; printf '\n__RC__%d__\n' "$?"; } )
+    # Run the transaction; on a broken/interrupted failure, auto-repair with
+    # fix-broken and retry the same step once (attempt 2).
+    local rc=-1 attempt
+    for attempt in 1 2; do
+        local dl_pct=0 in_pct=0 saw_dl=0 installing=0
+        local counter='resolving…' inname='' dlname=''
+        local start=$SECONDS i=0 fd
+        rc=-1
+        (( attempt == 2 )) && counter='retrying after repair…'
+        exec {fd}< <( { "${cmd[@]}" -o APT::Status-Fd=1 2>>"$log"; printf '\n__RC__%d__\n' "$?"; } )
 
-    render_live "${SPIN[0]}" "$label" '00:00' "$counter" 0 1
-    draw_total_footer "$dl_lo"
+        render_live "${SPIN[0]}" "$label" '00:00' "$counter" 0 1
+        draw_total_footer "$dl_lo"
 
-    while true; do
-        if IFS= read -t 0.12 -r -u "$fd" line; then
-            case "$line" in
-                __RC__*__)
-                    rc=${line#__RC__}; rc=${rc%__}; continue
-                    ;;
-                dlstatus:*)
-                    local rest=${line#dlstatus:}; rest=${rest#*:}   # drop the id
-                    local p=${rest%%:*} msg=${rest#*:}
-                    p=${p%%.*}; saw_dl=1; dl_pct=${p:-0}
-                    dlname=$(trunc "$msg" 42)
-                    counter="Downloading ${dl_pct}%  ${dlname}"
-                    ;;
-                pmstatus:*)
-                    local rest=${line#pmstatus:}
-                    local pk=${rest%%:*}; rest=${rest#*:}
-                    local p=${rest%%:*} msg=${rest#*:}
-                    p=${p%%.*}; installing=1; in_pct=${p:-0}
-                    [[ $pk == dpkg* || -z $pk ]] || inname=$pk
-                    counter="$p2 ${in_pct}%  ${inname:-$(trunc "$msg" 42)}"
-                    ;;
-                *)
-                    printf '%s\n' "$line" >>"$log"
-                    ;;
-            esac
+        while true; do
+            if IFS= read -t 0.12 -r -u "$fd" line; then
+                case "$line" in
+                    __RC__*__)
+                        rc=${line#__RC__}; rc=${rc%__}; continue
+                        ;;
+                    dlstatus:*)
+                        local rest=${line#dlstatus:}; rest=${rest#*:}   # drop the id
+                        local p=${rest%%:*} msg=${rest#*:}
+                        p=${p%%.*}; saw_dl=1; dl_pct=${p:-0}
+                        dlname=$(trunc "$msg" 42)
+                        counter="Downloading ${dl_pct}%  ${dlname}"
+                        ;;
+                    pmstatus:*)
+                        local rest=${line#pmstatus:}
+                        local pk=${rest%%:*}; rest=${rest#*:}
+                        local p=${rest%%:*} msg=${rest#*:}
+                        p=${p%%.*}; installing=1; in_pct=${p:-0}
+                        [[ $pk == dpkg* || -z $pk ]] || inname=$pk
+                        counter="$p2 ${in_pct}%  ${inname:-$(trunc "$msg" 42)}"
+                        ;;
+                    *)
+                        printf '%s\n' "$line" >>"$log"
+                        ;;
+                esac
+            else
+                (( $? > 128 )) || break
+            fi
+            # section bar (download = first half, install = second half) and the
+            # absolute TOTAL position within this step's two bands
+            local f=0 pm=$dl_lo
+            if (( installing )); then
+                f=$(( saw_dl ? 500 + in_pct * 5 : in_pct * 10 ))
+                pm=$(( in_lo + (in_hi - in_lo) * in_pct / 100 ))
+            elif (( saw_dl )); then
+                f=$(( dl_pct * 5 ))
+                pm=$(( dl_lo + (dl_hi - dl_lo) * dl_pct / 100 ))
+            fi
+            (( f > 1000 )) && f=1000
+            render_live "${SPIN[i%6]}" "$label" "$(fmt_time $(( SECONDS - start )))" "$counter" "$f" 1000
+            draw_total_footer "$pm"
+            i=$(( i + 1 ))
+        done
+        exec {fd}<&-
+
+        (( rc == 0 )) && break
+        # First-attempt failure that looks like a broken/interrupted dpkg state:
+        # collapse this node to a warning, auto-repair, then loop to retry once.
+        if (( attempt == 1 )) && apt_looks_broken "$log"; then
+            finish_node '⚠' "$GOLD" "$label — broken state detected, auto-repairing…"
+            run_step "Repairing broken packages (fix-broken)" _do_fix_broken
+            connector
+            : > "$log"                         # fresh log for the retry
         else
-            (( $? > 128 )) || break
+            break
         fi
-        # section bar (download = first half, install = second half) and the
-        # absolute TOTAL position within this step's two bands
-        local f=0 pm=$dl_lo
-        if (( installing )); then
-            f=$(( saw_dl ? 500 + in_pct * 5 : in_pct * 10 ))
-            pm=$(( in_lo + (in_hi - in_lo) * in_pct / 100 ))
-        elif (( saw_dl )); then
-            f=$(( dl_pct * 5 ))
-            pm=$(( dl_lo + (dl_hi - dl_lo) * dl_pct / 100 ))
-        fi
-        (( f > 1000 )) && f=1000
-        render_live "${SPIN[i%6]}" "$label" "$(fmt_time $(( SECONDS - start )))" "$counter" "$f" 1000
-        draw_total_footer "$pm"
-        i=$(( i + 1 ))
     done
-    exec {fd}<&-
 
     draw_total_footer "$in_hi"
     if (( rc == 0 )); then
