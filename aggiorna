@@ -187,6 +187,28 @@ error_box() {
     printf '   %s──────────────────────────────────────────────%s\n' "$RED" "$RESET"
 }
 
+#== Interactive questions from a running command ==============================
+# A command that stops mid-line (no trailing newline) is waiting for an answer
+# on the terminal — e.g. a dpkg conffile prompt or a repository key question.
+# Its stdin IS the terminal, so the user can reply directly: we only need to
+# surface the hidden prompt, show the cursor, and freeze the live UI until the
+# command resumes.
+ask_begin() {
+    local label="$1" text="$2"
+    (( LIVE_DRAWN )) && printf '\e[%dA' "$LIVE_LINES"
+    LIVE_DRAWN=0
+    printf '\r   %s◈%s  %s%s — the command is asking:%s\e[K\n' \
+        "$GOLD" "$RESET" "$GOLD$BOLD" "$label" "$RESET"
+    printf '\r      %s│%s %s\e[K\n' "$GOLD" "$RESET" "$text"
+    printf '\r      %s│%s %stype the answer + ENTER (goes straight to the command)%s\e[K\n' \
+        "$GOLD" "$RESET" "$DIM" "$RESET"
+    printf '\r      %s➜%s \e[K' "$GOLD" "$RESET"
+    printf '\e[?25h'
+}
+
+# the command produced output again: hide the cursor and resume the pipeline
+ask_end() { printf '\e[?25l\n'; }
+
 #== Plain spinner step (no per-package progress: e.g. cromup) =================
 run_step() {
     local label="$1"; shift
@@ -194,11 +216,24 @@ run_step() {
     connector
     "$@" >"$log" 2>&1 &
     local pid=$! i=0 start=$SECONDS
+    local asking=0 stall=0 last_size=0 size
     while kill -0 "$pid" 2>/dev/null; do
-        printf '\r   %s%s%s  %s   %s%s%s\e[K' \
-            "$CYAN" "${SPIN[i%6]}" "$RESET" "$label" "$DIM" "$(fmt_time $(( SECONDS - start )))" "$RESET"
+        # a log that stopped growing on an unterminated line is a pending prompt
+        size=$(stat -c %s "$log" 2>/dev/null || echo 0)
+        if (( size != last_size )); then
+            last_size=$size; stall=0
+            (( asking )) && { ask_end; asking=0; }
+        elif (( ! asking && size > 0 )) && [[ -n $(tail -c 1 "$log") ]] && (( ++stall >= 15 )); then
+            ask_begin "$label" "$(tail -n 1 "$log")"
+            asking=1
+        fi
+        if (( ! asking )); then
+            printf '\r   %s%s%s  %s   %s%s%s\e[K' \
+                "$CYAN" "${SPIN[i%6]}" "$RESET" "$label" "$DIM" "$(fmt_time $(( SECONDS - start )))" "$RESET"
+        fi
         i=$(( i + 1 )); sleep 0.12
     done
+    (( asking )) && { ask_end; asking=0; }
     wait "$pid"; local rc=$?
     if (( rc == 0 )); then
         printf '\r   %s●%s  %s\e[K\n' "$GREEN" "$RESET" "$label"
@@ -359,8 +394,13 @@ run_apt() {
         render_live "${SPIN[0]}" "$label" '00:00' "$counter" 0 1
         draw_total_footer "$dl_lo"
 
+        local pending='' stall=0 asking=0 lsize=0 lstall=0 sz
         while true; do
+            line=''
             if IFS= read -t 0.12 -r -u "$fd" line; then
+                (( asking )) && { ask_end; asking=0; }
+                [[ -n $pending ]] && { line="$pending$line"; pending=''; }
+                stall=0
                 case "$line" in
                     __RC__*__)
                         rc=${line#__RC__}; rc=${rc%__}; continue
@@ -386,7 +426,27 @@ run_apt() {
                 esac
             else
                 (( $? > 128 )) || break
+                # timeout: read leaves any newline-less partial input in $line —
+                # a line that then stays unfinished is a prompt awaiting an answer
+                if [[ -n $line ]]; then
+                    pending+="$line"; stall=0
+                elif (( ! asking )) && [[ -n $pending ]] && (( ++stall >= 15 )); then
+                    printf '%s\n' "$pending" >>"$log"
+                    ask_begin "$label" "$pending"
+                    pending=''; asking=1
+                elif (( ! asking )) && [[ -z $pending ]]; then
+                    # stderr bypasses the pipe (2>>"$log"): a log that stopped
+                    # growing on an unterminated line is a prompt on stderr
+                    sz=$(stat -c %s "$log" 2>/dev/null || echo 0)
+                    if (( sz != lsize )); then
+                        lsize=$sz; lstall=0
+                    elif (( sz > 0 )) && [[ -n $(tail -c 1 "$log") ]] && (( ++lstall >= 15 )); then
+                        ask_begin "$label" "$(tail -n 1 "$log")"
+                        asking=1
+                    fi
+                fi
             fi
+            (( asking )) && continue           # UI frozen while the user answers
             # section bar (download = first half, install = second half) and the
             # absolute TOTAL position within this step's two bands
             local f=0 pm=$dl_lo
@@ -403,6 +463,8 @@ run_apt() {
             i=$(( i + 1 ))
         done
         exec {fd}<&-
+        (( asking )) && { ask_end; asking=0; }
+        [[ -n $pending ]] && printf '%s\n' "$pending" >>"$log"
 
         (( rc == 0 )) && break
         # First-attempt failure that looks like a broken/interrupted dpkg state:
@@ -452,14 +514,29 @@ run_flatpak() {
         else
             exec {fd}< <( { env LC_ALL=C flatpak uninstall -y "$ref"; printf '\n__RC__%d__\n' "$?"; } 2>&1 )
         fi
+        local pending='' stall=0 asking=0
         while true; do
+            line=''
             if IFS= read -t 0.12 -r -u "$fd" line; then
+                (( asking )) && { ask_end; asking=0; }
+                [[ -n $pending ]] && { line="$pending$line"; pending=''; }
+                stall=0
                 case "$line" in __RC__*__) lrc=${line#__RC__}; lrc=${lrc%__}; continue;; esac
                 printf '%s\n' "$line" >>"$log"
                 [[ $line =~ ([0-9]+)%[^0-9]*$ ]] && cur_pct=${BASH_REMATCH[1]}
             else
                 (( $? > 128 )) || break
+                # timeout: read leaves any newline-less partial input in $line —
+                # a line that then stays unfinished is a prompt awaiting an answer
+                if [[ -n $line ]]; then
+                    pending+="$line"; stall=0
+                elif (( ! asking )) && [[ -n $pending ]] && (( ++stall >= 15 )); then
+                    printf '%s\n' "$pending" >>"$log"
+                    ask_begin "$label" "$pending"
+                    pending=''; asking=1
+                fi
             fi
+            (( asking )) && continue           # UI frozen while the user answers
             local sd=$(( (idx - 1) * 1000 + cur_pct * 10 ))
             render_live "${SPIN[i%6]}" "$label" "$(fmt_time $(( SECONDS - start )))" \
                 "$verb $idx/$N: $ref" "$sd" "$(( N * 1000 ))"
@@ -467,6 +544,8 @@ run_flatpak() {
             i=$(( i + 1 ))
         done
         exec {fd}<&-
+        (( asking )) && { ask_end; asking=0; }
+        [[ -n $pending ]] && printf '%s\n' "$pending" >>"$log"
         (( lrc != 0 )) && rc=1
     done
 
@@ -549,7 +628,9 @@ START_AVAIL=$(df --output=avail / | tail -1 | tr -d ' ')
 plan_phase
 
 # The upgrade reuses the lists just refreshed during planning (no second update).
-# DEBIAN_FRONTEND=noninteractive keeps dpkg from stopping on conffile prompts.
+# DEBIAN_FRONTEND=noninteractive answers debconf questions with their defaults
+# (a dialog frontend would wreck the TUI); dpkg conffile prompts can still
+# appear — the ask_begin detector surfaces them and hands over the keyboard.
 # Each step is handed its slice of the TOTAL bar computed in plan_phase.
 run_apt      "System upgrade (APT)"        "Install" "$APT_UPG" 0          "$B_DLU_HI" "$B_DLU_HI" "$B_INU_HI" \
     sudo env LC_ALL=C DEBIAN_FRONTEND=noninteractive apt-get -y -q -o Dpkg::Use-Pty=0 full-upgrade
