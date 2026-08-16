@@ -134,6 +134,20 @@ teardown_footer() {
     printf '\e8'                               # back to the content cursor
 }
 
+# Uscita anticipata (disclaimer rifiutato, autenticazione fallita): libera le
+# righe riservate al footer, ripristina la scroll region e pulisce lo schermo —
+# altrimenti header, footer e testo restano a sporcare il terminale. Lo schermo
+# resta pulito come alla chiusura normale, con la sola riga di esito.
+exit_clean() {
+    local msg="$1" rc="${2:-0}"
+    teardown_footer
+    printf '\e[r'                              # scroll region di nuovo piena
+    printf '\e[?25h'                           # cursore visibile
+    printf '\e[H\e[2J\e[3J'                    # come `clear`, ma senza dipendere dal binario
+    printf '%s\n' "$msg"
+    exit "$rc"
+}
+
 # redraw the pinned TOTAL bar; argument = overall progress in per-mille (0..1000)
 # on the fixed phase-band scale. Uses absolute positioning + save/restore so it
 # never disturbs the scrolling pipeline above it.
@@ -558,6 +572,46 @@ run_flatpak() {
     rm -f "$log"
 }
 
+#== Domanda sì/no posta dallo script stesso ==================================
+ask_yes_no() {
+    local prompt="$1" ans
+    printf '\e[?25h'
+    read -r -p "$(printf '   %s◈%s  %s %s[y/N]%s ' "$GOLD" "$RESET" "$prompt" "$DIM" "$RESET")" ans
+    printf '\e[?25l'
+    [[ $ans =~ ^([yY]|[yY][eE][sS]|[sS]|[sS][iI])$ ]]
+}
+
+#== Disclaimer ===============================================================
+# Mostrato a ogni avvio, prima di toccare qualsiasi cosa e prima ancora di
+# chiedere la password: aggiornare un sistema è un'operazione che può andare
+# storta, e chi lancia lo script deve poterlo sapere e potersi fermare a costo
+# zero. Rifiutando non viene eseguito nessun comando.
+disclaimer() {
+    local rule; rule=$(rep 68 '─')
+    printf "   %s⚠  AVVISO DI RESPONSABILITÀ — LEGGI PRIMA DI CONTINUARE%s\n" "$GOLD$BOLD" "$RESET"
+    printf "   %s%s%s\n" "$DIM" "$rule" "$RESET"
+    printf "      %sAGGIORNA%s esegue una sequenza di comandi di sistema (apt-get,\n" "$BOLD" "$RESET"
+    printf "      flatpak) per aggiornare la tua distribuzione basata su Debian.\n\n"
+    printf "      Sono operazioni che modificano il sistema in profondità: un\n"
+    printf "      full-upgrade può rimuovere pacchetti per risolvere le dipendenze, e\n"
+    printf "      un aggiornamento interrotto o un pacchetto difettoso possono lasciare\n"
+    printf "      il sistema instabile o non avviabile.\n\n"
+    printf "      AGGIORNA è distribuito %ssenza alcuna garanzia%s, come previsto dalle\n" "$BOLD" "$RESET"
+    printf "      sezioni 15 e 16 della licenza GNU GPL v3. %sL'autore non risponde di\n" "$BOLD"
+    printf "      danni, perdita di dati o sistemi resi inutilizzabili%s derivanti\n" "$RESET"
+    printf "      dall'uso dello script.\n\n"
+    printf "      %sContinuando, dichiari di usare AGGIORNA a tuo rischio e di assumerti\n" "$GOLD"
+    printf "      la piena responsabilità delle modifiche apportate al tuo sistema.%s\n\n" "$RESET"
+    printf "      %sSe hai dati importanti, fai un backup prima di procedere.%s\n" "$DIM" "$RESET"
+    printf "   %s%s%s\n\n" "$DIM" "$rule" "$RESET"
+
+    if ! ask_yes_no "Accetti e vuoi continuare?"; then
+        exit_clean "   ${DIM}Uscita: nessuna modifica effettuata.${RESET}" 0
+    fi
+    printf '\e[?25h'                      # la password va digitata a cursore visibile
+    echo
+}
+
 #== Report card =============================================================
 card_line() {
     local label="$1" value="$2" vcolor="$3"
@@ -611,12 +665,14 @@ clear
 setup_footer
 header
 
+# Nulla viene toccato finché l'utente non accetta
+disclaimer
+
 # Root credentials + keep-alive (steps read package-manager output through a
 # pipe, so sudo must never stop to ask for the password mid-run)
 printf '   %s🔑 Administrator authentication required...%s\n\n' "$GOLD" "$RESET"
 if ! sudo -v; then
-    printf '   %s✗ Authentication failed. Exiting.%s\n' "$RED" "$RESET"
-    exit 1
+    exit_clean "   ${RED}✗ Authentication failed. Exiting.${RESET}" 1
 fi
 ( while true; do sudo -n true; sleep 50; kill -0 "$$" 2>/dev/null || exit; done ) 2>/dev/null &
 SUDO_PID=$!
