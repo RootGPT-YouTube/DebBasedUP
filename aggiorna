@@ -608,8 +608,16 @@ disclaimer() {
     if ! ask_yes_no "Accetti e vuoi continuare?"; then
         exit_clean "   ${DIM}Uscita: nessuna modifica effettuata.${RESET}" 0
     fi
+
+    # Accettato: l'avviso ha fatto il suo lavoro e non deve restare a occupare
+    # lo schermo per tutto l'aggiornamento. Si pulisce tutto (scrollback
+    # compreso, così non lo si ritrova scorrendo indietro), si ridisegnano
+    # l'intestazione e la barra TOTAL, e il terminale torna libero per la
+    # pipeline.
+    printf '\e[H\e[2J\e[3J'               # come `clear`, senza dipendere dal binario
+    header
+    draw_total_footer 0                   # \e[2J ha cancellato anche le righe fisse
     printf '\e[?25h'                      # la password va digitata a cursore visibile
-    echo
 }
 
 #== Report card =============================================================
