@@ -21,8 +21,14 @@ Lo stesso avviso compare all'avvio del comando, prima ancora che venga chiesta l
 
 - **Header a gradiente truecolor** con il titolo del progetto.
 - **Pipeline verticale**: ogni operazione è un nodo collegato (`●` completato, `✗` fallito) con uno spinner ad arco rotante e un timer mentre è in corso.
-- **Output pulito**: l'output dei comandi è nascosto durante l'esecuzione e mostrato in un riquadro **solo in caso di errore**.
-- **Domande interattive**: se un comando fa una domanda nel terminale (es. un prompt di dpkg su un file di configurazione), lo script se ne accorge, la mostra in un riquadro dedicato e ti passa la tastiera — la risposta digitata arriva direttamente al comando, poi la pipeline riprende.
+- **Output pulito**: l'output dei comandi è normalmente nascosto durante l'esecuzione; viene mostrato in caso di errore, di domanda o di silenzio prolungato.
+- **Domande interattive**: le domande riconosciute vengono mostrate dopo circa 2 secondi, insieme all'output recente. Conta soprattutto per i **prompt di dpkg sui file di configurazione**: `DEBIAN_FRONTEND=noninteractive` zittisce debconf ma non dpkg, che per un conffile modificato chiede lo stesso e aspetta — e quella domanda esce su *stderr*, non sul canale da cui arriva l'avanzamento. Il riquadro mostra anche le righe precedenti, dove stanno le opzioni (`Y/I/N/O/D/Z`): da sola l'ultima riga non basta per rispondere. Il rilevatore ignora colori e controlli del terminale, conserva la domanda anche se seguono righe vuote e riconosce anche «Press ENTER»/«Premi INVIO». Se dopo circa 45 secondi non arriva nuovo output viene mostrato comunque il contesto recente, in silenzio (il campanello suona solo per le domande vere): un comando lento non è necessariamente bloccato, quindi **rispondi solo se c'è una richiesta esplicita, altrimenti attendi**. Nessuna risposta viene inviata automaticamente. Le domande poste dallo script stesso vengono stampate direttamente, senza `read -p`, e la risposta viene letta dal terminale.
+- **Autenticazione**: la password viene chiesta all'inizio; i comandi privilegiati usano `sudo -n`, così un'eventuale scadenza delle credenziali non apre una richiesta di password nascosta sotto il disegno della pipeline.
 - **Scheda di resoconto** finale con operazioni riuscite, tempo impiegato, spazio liberato su disco ed esito dell'autoaggiornamento dello script.
+
+## Test locali
+
+`bash -n aggiorna && bash -n install` controlla la sintassi degli script.
+`python3 -m unittest discover -s tests -v` verifica il rilevamento e la visualizzazione delle domande con comandi simulati, senza aggiornare il sistema o richiedere privilegi.
 
 Operazioni eseguite: `apt-get update`, `apt-get full-upgrade`, `apt-get autoremove`, `flatpak update`, `flatpak uninstall --unused`, l'hook opzionale `cromup` (se presente) e l'autoaggiornamento dello script stesso.

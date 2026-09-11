@@ -3,3 +3,6 @@
 # motivo, nemmeno su un repo privato: la visibilita' puo' cambiare, la
 # history no.
 memory/
+
+# Python regression-test bytecode
+tests/__pycache__/

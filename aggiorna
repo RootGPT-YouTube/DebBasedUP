@@ -202,20 +202,106 @@ error_box() {
 }
 
 #== Interactive questions from a running command ==============================
-# A command that stops mid-line (no trailing newline) is waiting for an answer
-# on the terminal — e.g. a dpkg conffile prompt or a repository key question.
-# Its stdin IS the terminal, so the user can reply directly: we only need to
-# surface the hidden prompt, show the cursor, and freeze the live UI until the
-# command resumes.
+# Recognized questions, with or without a newline, surface after ~1.8 s.
+# Ignore terminal controls and blank lines when recognizing them: a color reset
+# after "[y/N]" or an extra newline must not make the question disappear.
+#
+# Serve davvero anche qui: DEBIAN_FRONTEND=noninteractive zittisce debconf, ma
+# **non** dpkg, che per un conffile modificato chiede lo stesso e aspetta sul
+# terminale ("*** file ... (Y/I/N/O/D/Z) [default=N] ?").
+#
+# No text heuristic can recognize every prompt (e.g. a numbered menu). After a
+# long silence, expose the recent log anyway, without claiming that a slow
+# command is necessarily asking a question. Never supply an answer.
+#
+# That fallback must stay rarer than the real thing: apt-get goes quiet for tens
+# of seconds while it unpacks a big package, and there the box freezes a bar that
+# is doing fine. 45 s clears those pauses; a command that is genuinely stuck
+# stays stuck, so the safety net still catches it.
+PROMPT_TICKS=15
+QUIET_TICKS=375                     # ~45 s at the 0.12 s poll interval
+
+# The detector only sees what actually leaves the command. Writing to a pipe
+# switches stdio to block buffering, which can hold a question — printed without
+# a trailing newline, so nothing forces a flush — inside the buffer until much
+# later output fills it: the user would sit in front of a frozen bar answering
+# nothing. stdbuf helps programs that use standard C stdio buffering; it cannot
+# force a program to emit a prompt that it suppresses internally.
+# Note sudo drops LD_PRELOAD, so stdbuf must sit *inside* sudo to have an effect.
+# Empty (and everything behaves as before) if stdbuf is not installed.
+UNBUF=()
+command -v stdbuf >/dev/null 2>&1 && UNBUF=(stdbuf -o0 -e0)
+
+# Normalize one line in place for matching and safe display. Replaying a
+# captured clear-screen/cursor sequence could erase the question itself.
+clean_prompt_line() {
+    local -n _text=$1
+    local LC_ALL=C                         # ANSI ranges are ASCII, not locale collation
+    local re_osc=$'\e''\][^'$'\a\e'']*('$'\a''|'$'\e''\\)'
+    local re_csi=$'\e''\[[0-?]*[ -/]*[@-~]'
+    local re_esc=$'\e''[@-_]'
+    while [[ $_text =~ $re_osc ]]; do _text=${_text/"${BASH_REMATCH[0]}"/}; done
+    while [[ $_text =~ $re_csi ]]; do _text=${_text/"${BASH_REMATCH[0]}"/}; done
+    while [[ $_text =~ $re_esc ]]; do _text=${_text/"${BASH_REMATCH[0]}"/}; done
+    _text=${_text%$'\r'}
+    _text=${_text##*$'\r'}
+    _text=${_text//$'\t'/    }
+    _text=${_text//[[:cntrl:]]/}
+    _text=${_text%"${_text##*[![:space:]]}"}
+}
+
+remember_prompt_line() {
+    local text=$1
+    local -n _last=$2
+    clean_prompt_line text
+    [[ -z $text ]] || _last=$text
+}
+
+# does this line read like a question waiting for an answer?
+is_question() {
+    local s=$1
+    clean_prompt_line s
+    s=${s,,}
+    [[ -z $s ]] && return 1
+    local re_brk='\[[^]]*[yn][^]]*\][:.]?$'        # ...[Y/n]   ...[y/N]:
+    local re_par='\([yn][^)]*\)[:.]?$'             # ...(y/n):
+    local re_end='[:?][[:space:]]*$'
+    local re_kw='(is this ok|do you want to continue|continue|proceed|confirm|password|choose|choice|select|what would you like to do|continuare|procedere|conferma|scegli|scelta|selezion)'
+    local re_enter='(press|hit|premi|premere)[[:space:]]+.*(enter|return|invio|any key|un tasto)'
+    [[ $s == *'?' ]]     && return 0               # ...continue?   e il conffile di dpkg
+    [[ $s =~ $re_brk ]]  && return 0
+    [[ $s =~ $re_par ]]  && return 0
+    [[ $s =~ $re_enter ]] && return 0
+    # a keyword prompt that ends where an answer would go
+    [[ $s =~ $re_end && $s =~ $re_kw ]] && return 0
+    return 1
+}
+
 ask_begin() {
-    local label="$1" text="$2"
+    local label="$1" text="$2" kind="${3:-question}" line
     (( LIVE_DRAWN )) && printf '\e[%dA' "$LIVE_LINES"
     LIVE_DRAWN=0
-    printf '\r   %s◈%s  %s%s — the command is asking:%s\e[K\n' \
-        "$GOLD" "$RESET" "$GOLD$BOLD" "$label" "$RESET"
-    printf '\r      %s│%s %s\e[K\n' "$GOLD" "$RESET" "$text"
-    printf '\r      %s│%s %stype the answer + ENTER (goes straight to the command)%s\e[K\n' \
-        "$GOLD" "$RESET" "$DIM" "$RESET"
+    # Solo una domanda vera suona: il ripiego sul silenzio non deve trasformare
+    # una pausa lunga ma sana in un allarme.
+    [[ $kind == question ]] && printf '\a'
+    if [[ $kind == question ]]; then
+        printf '\r   %s◈%s  %s%s — the command is asking:%s\e[K\n' \
+            "$GOLD" "$RESET" "$GOLD$BOLD" "$label" "$RESET"
+    else
+        printf '\r   %s◈%s  %s%s — no new output; recent details:%s\e[K\n' \
+            "$GOLD" "$RESET" "$GOLD$BOLD" "$label" "$RESET"
+    fi
+    while IFS= read -r line; do
+        clean_prompt_line line
+        [[ -z $line ]] || printf '\r      %s│%s %s\e[K\n' "$GOLD" "$RESET" "$line"
+    done <<< "$text"
+    if [[ $kind == question ]]; then
+        printf '\r      %s│%s %stype the answer + ENTER (goes straight to the command)%s\e[K\n' \
+            "$GOLD" "$RESET" "$DIM" "$RESET"
+    else
+        printf '\r      %s│%s %sIf a question is shown, answer it; otherwise wait.%s\e[K\n' \
+            "$GOLD" "$RESET" "$DIM" "$RESET"
+    fi
     printf '\r      %s➜%s \e[K' "$GOLD" "$RESET"
     printf '\e[?25h'
 }
@@ -223,23 +309,62 @@ ask_begin() {
 # the command produced output again: hide the cursor and resume the pipeline
 ask_end() { printf '\e[?25l\n'; }
 
+# Idle-tick prompt detector shared by every runner. Called once per
+# poll timeout with the runner's own state variables (passed by name):
+#   poll_prompt <label> <pending> <stall> <asking> <last_line> <log>
+poll_prompt() {
+    local _lbl=$1 _log=$6
+    local -n _p=$2 _s=$3 _a=$4 _l=$5
+    (( _a )) && return 0                     # already showing the output
+    _s=$(( _s + 1 ))
+    (( _s >= PROMPT_TICKS )) || return 0
+    local candidate=$_p kind=idle context
+    clean_prompt_line candidate
+    [[ -n $candidate ]] || candidate=$_l
+    if is_question "$candidate"; then
+        kind=question
+    else
+        (( _s >= QUIET_TICKS )) || return 0
+    fi
+    # Include preceding warnings/options, not just the final question line: il
+    # conffile di dpkg spiega le opzioni (Y/I/N/O/D/Z) nelle righe che stanno
+    # sopra, e da sola l'ultima riga non basta per rispondere.
+    context=$(tail -n 12 "$_log"; [[ -z $_p ]] || printf '%s\n' "$_p")
+    [[ -n $context ]] || context=${candidate:-'(no output available yet)'}
+    ask_begin "$_lbl" "$context" "$kind"
+    if [[ $kind == question && -n $_p ]]; then
+        printf '%s\n' "$_p" >>"$_log"
+        _p=''
+    fi
+    _a=1
+}
+
 #== Plain spinner step (no per-package progress: e.g. cromup) =================
 run_step() {
     local label="$1"; shift
     local log; log=$(mktemp)
     connector
-    "$@" >"$log" 2>&1 &
+    # <&0 is not decoration: bash gives an asynchronous command /dev/null for
+    # stdin, so without it the command would hit EOF the moment it asked
+    # anything — the question would show up on screen with no way to answer it.
+    if declare -F "$1" >/dev/null; then
+        "$@" >"$log" 2>&1 <&0 &
+    else
+        "${UNBUF[@]}" "$@" >"$log" 2>&1 <&0 &
+    fi
     local pid=$! i=0 start=$SECONDS
-    local asking=0 stall=0 last_size=0 size
+    local asking=0 stall=0 last_size=0 size pending='' last_line='' text
     while kill -0 "$pid" 2>/dev/null; do
-        # a log that stopped growing on an unterminated line is a pending prompt
         size=$(stat -c %s "$log" 2>/dev/null || echo 0)
         if (( size != last_size )); then
             last_size=$size; stall=0
             (( asking )) && { ask_end; asking=0; }
-        elif (( ! asking && size > 0 )) && [[ -n $(tail -c 1 "$log") ]] && (( ++stall >= 15 )); then
-            ask_begin "$label" "$(tail -n 1 "$log")"
-            asking=1
+            while IFS= read -r text || [[ -n $text ]]; do
+                remember_prompt_line "$text" last_line
+            done < <(tail -n 12 "$log")
+        else
+            # Partial lines are already in this log, unlike streaming runners.
+            poll_prompt "$label" pending stall asking last_line "$log"
         fi
         if (( ! asking )); then
             printf '\r   %s%s%s  %s   %s%s%s\e[K' \
@@ -293,9 +418,9 @@ plan_phase() {
     local tmp; tmp=$(mktemp)
     (
         # one metadata refresh; the upgrade below reuses these lists
-        sudo env LC_ALL=C apt-get update >/dev/null 2>&1
-        upg=$(apt_count install sudo env LC_ALL=C apt-get -s full-upgrade)
-        rem=$(apt_count remove  sudo env LC_ALL=C apt-get -s autoremove)
+        sudo -n env LC_ALL=C apt-get update >/dev/null 2>&1
+        upg=$(apt_count install sudo -n env LC_ALL=C apt-get -s full-upgrade)
+        rem=$(apt_count remove  sudo -n env LC_ALL=C apt-get -s autoremove)
         mapfile -t fu < <(flatpak_refs update)
         mapfile -t fx < <(flatpak_refs unused)
         {
@@ -365,8 +490,8 @@ apt_looks_broken() {
 
 # the recovery command itself (driven as a single step through run_step)
 _do_fix_broken() {
-    sudo env LC_ALL=C DEBIAN_FRONTEND=noninteractive dpkg --configure -a
-    sudo env LC_ALL=C DEBIAN_FRONTEND=noninteractive \
+    sudo -n "${UNBUF[@]}" env LC_ALL=C DEBIAN_FRONTEND=noninteractive dpkg --configure -a
+    sudo -n "${UNBUF[@]}" env LC_ALL=C DEBIAN_FRONTEND=noninteractive \
         apt-get -y -q -o Dpkg::Use-Pty=0 --fix-broken install
 }
 
@@ -398,7 +523,7 @@ run_apt() {
     # fix-broken and retry the same step once (attempt 2).
     local rc=-1 attempt
     for attempt in 1 2; do
-        local dl_pct=0 in_pct=0 saw_dl=0 installing=0
+        local dl_pct=0 in_pct=0 saw_dl=0 installing=0 last_line=''
         local counter='resolving…' inname='' dlname=''
         local start=$SECONDS i=0 fd
         rc=-1
@@ -408,7 +533,7 @@ run_apt() {
         render_live "${SPIN[0]}" "$label" '00:00' "$counter" 0 1
         draw_total_footer "$dl_lo"
 
-        local pending='' stall=0 asking=0 lsize=0 lstall=0 sz
+        local pending='' stall=0 asking=0 lsize=0 sz line text
         while true; do
             line=''
             if IFS= read -t 0.12 -r -u "$fd" line; then
@@ -436,6 +561,7 @@ run_apt() {
                         ;;
                     *)
                         printf '%s\n' "$line" >>"$log"
+                        remember_prompt_line "$line" last_line
                         ;;
                 esac
             else
@@ -443,20 +569,25 @@ run_apt() {
                 # timeout: read leaves any newline-less partial input in $line —
                 # a line that then stays unfinished is a prompt awaiting an answer
                 if [[ -n $line ]]; then
+                    (( asking )) && { ask_end; asking=0; }
                     pending+="$line"; stall=0
-                elif (( ! asking )) && [[ -n $pending ]] && (( ++stall >= 15 )); then
-                    printf '%s\n' "$pending" >>"$log"
-                    ask_begin "$label" "$pending"
-                    pending=''; asking=1
-                elif (( ! asking )) && [[ -z $pending ]]; then
-                    # stderr bypasses the pipe (2>>"$log"): a log that stopped
-                    # growing on an unterminated line is a prompt on stderr
+                else
+                    # stderr bypasses the pipe (2>>"$log"), e il conffile di dpkg
+                    # esce proprio di li': un log che cresce vuol dire comando
+                    # vivo, un log fermo che l'ultima riga puo' essere la domanda.
                     sz=$(stat -c %s "$log" 2>/dev/null || echo 0)
                     if (( sz != lsize )); then
-                        lsize=$sz; lstall=0
-                    elif (( sz > 0 )) && [[ -n $(tail -c 1 "$log") ]] && (( ++lstall >= 15 )); then
-                        ask_begin "$label" "$(tail -n 1 "$log")"
-                        asking=1
+                        lsize=$sz; stall=0
+                        (( asking )) && { ask_end; asking=0; }
+                        while IFS= read -r text || [[ -n $text ]]; do
+                            remember_prompt_line "$text" last_line
+                        done < <(tail -n 12 "$log")
+                    else
+                        poll_prompt "$label" pending stall asking last_line "$log"
+                        # poll_prompt puo' aver scritto la domanda nel log: senza
+                        # risincronizzare, al giro dopo quella crescita sembra
+                        # output nuovo e il riquadro appena aperto viene chiuso.
+                        (( asking )) && lsize=$(stat -c %s "$log" 2>/dev/null || echo 0)
                     fi
                 fi
             fi
@@ -524,11 +655,11 @@ run_flatpak() {
         idx=$(( idx + 1 ))
         local cur_pct=0 lrc=0 fd
         if [[ $mode == update ]]; then
-            exec {fd}< <( { env LC_ALL=C flatpak update -y "$ref"; printf '\n__RC__%d__\n' "$?"; } 2>&1 )
+            exec {fd}< <( { "${UNBUF[@]}" env LC_ALL=C flatpak update -y "$ref"; printf '\n__RC__%d__\n' "$?"; } 2>&1 )
         else
-            exec {fd}< <( { env LC_ALL=C flatpak uninstall -y "$ref"; printf '\n__RC__%d__\n' "$?"; } 2>&1 )
+            exec {fd}< <( { "${UNBUF[@]}" env LC_ALL=C flatpak uninstall -y "$ref"; printf '\n__RC__%d__\n' "$?"; } 2>&1 )
         fi
-        local pending='' stall=0 asking=0
+        local pending='' stall=0 asking=0 last_line='' line
         while true; do
             line=''
             if IFS= read -t 0.12 -r -u "$fd" line; then
@@ -537,17 +668,17 @@ run_flatpak() {
                 stall=0
                 case "$line" in __RC__*__) lrc=${line#__RC__}; lrc=${lrc%__}; continue;; esac
                 printf '%s\n' "$line" >>"$log"
+                remember_prompt_line "$line" last_line
                 [[ $line =~ ([0-9]+)%[^0-9]*$ ]] && cur_pct=${BASH_REMATCH[1]}
             else
                 (( $? > 128 )) || break
                 # timeout: read leaves any newline-less partial input in $line —
                 # a line that then stays unfinished is a prompt awaiting an answer
                 if [[ -n $line ]]; then
+                    (( asking )) && { ask_end; asking=0; }
                     pending+="$line"; stall=0
-                elif (( ! asking )) && [[ -n $pending ]] && (( ++stall >= 15 )); then
-                    printf '%s\n' "$pending" >>"$log"
-                    ask_begin "$label" "$pending"
-                    pending=''; asking=1
+                else
+                    poll_prompt "$label" pending stall asking last_line "$log"
                 fi
             fi
             (( asking )) && continue           # UI frozen while the user answers
@@ -572,11 +703,37 @@ run_flatpak() {
     rm -f "$log"
 }
 
-#== Domanda sì/no posta dallo script stesso ==================================
+#== Domande sì/no poste dallo script stesso ==================================
+# Il prompt non viene affidato a `read -p`. Bash stampa il prompt di `read -p`
+# soltanto quando lo stdin del read è un terminale, e lo manda su stderr: basta
+# che lo script venga lanciato con stdin diverso dal terminale (una pipe, un
+# redirect, un lanciatore che passa stdin altrove) perché la domanda sparisca
+# del tutto mentre il read continua ad aspettare. È il modo peggiore di
+# sbagliare: si resta fermi davanti a uno schermo muto, a rispondere alla cieca.
+# Qui il prompt lo stampiamo noi, e la risposta la leggiamo dal terminale vero.
+#
+# ask_read <variabile> — legge una riga dal terminale, non da stdin. Se non
+# esiste un terminale di controllo ripiega su stdin; se non c'è nemmeno quello
+# la risposta resta vuota (che per una domanda y/N vuol dire "no", la scelta
+# prudente) invece di bloccare lo script per sempre.
+ask_read() {
+    local -n _ans=$1
+    _ans=''
+    # `[ -r /dev/tty ]` non basta: senza terminale di controllo (cron, un
+    # lanciatore, una sessione staccata) il file c'e' e risulta leggibile, ma
+    # aprirlo fallisce e bash stampa l'errore su stderr. Si tenta e si ripiega.
+    if [ -r /dev/tty ] && { IFS= read -r _ans < /dev/tty; } 2>/dev/null; then
+        return 0
+    fi
+    IFS= read -r _ans || _ans=''
+}
+
 ask_yes_no() {
     local prompt="$1" ans
     printf '\e[?25h'
-    read -r -p "$(printf '   %s◈%s  %s %s[y/N]%s ' "$GOLD" "$RESET" "$prompt" "$DIM" "$RESET")" ans
+    printf '\a'                                   # una domanda si deve anche sentire
+    printf '   %s◈%s  %s %s[y/N]%s ' "$GOLD" "$RESET" "$prompt" "$DIM" "$RESET"
+    ask_read ans
     printf '\e[?25l'
     [[ $ans =~ ^([yY]|[yY][eE][sS]|[sS]|[sS][iI])$ ]]
 }
@@ -677,7 +834,9 @@ header
 disclaimer
 
 # Root credentials + keep-alive (steps read package-manager output through a
-# pipe, so sudo must never stop to ask for the password mid-run)
+# pipe, so sudo must never stop to ask for the password mid-run). Captured steps
+# also use sudo -n: if the keep-alive fails, report an error instead of drawing
+# over a password prompt that sudo writes straight to /dev/tty, bypassing logs.
 printf '   %s🔑 Administrator authentication required...%s\n\n' "$GOLD" "$RESET"
 if ! sudo -v; then
     exit_clean "   ${RED}✗ Authentication failed. Exiting.${RESET}" 1
@@ -697,9 +856,9 @@ plan_phase
 # appear — the ask_begin detector surfaces them and hands over the keyboard.
 # Each step is handed its slice of the TOTAL bar computed in plan_phase.
 run_apt      "System upgrade (APT)"        "Install" "$APT_UPG" 0          "$B_DLU_HI" "$B_DLU_HI" "$B_INU_HI" \
-    sudo env LC_ALL=C DEBIAN_FRONTEND=noninteractive apt-get -y -q -o Dpkg::Use-Pty=0 full-upgrade
+    sudo -n "${UNBUF[@]}" env LC_ALL=C DEBIAN_FRONTEND=noninteractive apt-get -y -q -o Dpkg::Use-Pty=0 full-upgrade
 run_apt      "Removing orphaned packages"  "Remove"  "$APT_REM" "$B_INU_HI" "$B_INU_HI" "$B_INU_HI" "$B_INA_HI" \
-    sudo env LC_ALL=C DEBIAN_FRONTEND=noninteractive apt-get -y -q -o Dpkg::Use-Pty=0 autoremove
+    sudo -n "${UNBUF[@]}" env LC_ALL=C DEBIAN_FRONTEND=noninteractive apt-get -y -q -o Dpkg::Use-Pty=0 autoremove
 run_flatpak  "Updating Flatpaks"           update "$B_INA_HI" "$B_FPU_HI" "${FU_REFS[@]}"
 run_flatpak  "Removing unused Flatpaks"    remove "$B_FPU_HI" 1000         "${FX_REFS[@]}"
 
@@ -712,7 +871,19 @@ END_AVAIL=$(df --output=avail / | tail -1 | tr -d ' ')
 teardown_footer
 
 #== Script self-update ======================================================
-if curl -fsSL https://raw.githubusercontent.com/RootGPT-YouTube/DebBasedUP/main/aggiorna -o /tmp/aggiorna.tmp 2>/dev/null; then
+# Fra l'ultimo nodo della pipeline e la scheda di resoconto c'e' un passo che non
+# disegna niente: l'autoaggiornamento via rete. Se va per le lunghe lo schermo
+# resta fermo sull'ultimo nodo senza spiegare perche' — e uno schermo fermo e
+# muto e' indistinguibile da uno script piantato. Una riga, almeno, dice a che
+# punto siamo.
+printf '   %s┃%s\n' "$DIM" "$RESET"
+printf '   %s⋯  controlli finali e autoaggiornamento…%s\n' "$DIM" "$RESET"
+
+# Timeout espliciti: senza, un mirror che non risponde lascia curl appeso a
+# tempo indeterminato proprio qui, dove non si muove piu' niente a schermo.
+if curl -fsSL --connect-timeout 10 --max-time 60 \
+        https://raw.githubusercontent.com/RootGPT-YouTube/DebBasedUP/main/aggiorna \
+        -o /tmp/aggiorna.tmp 2>/dev/null; then
     if ! cmp -s /tmp/aggiorna.tmp /usr/local/bin/aggiorna 2>/dev/null; then
         if sudo mv /tmp/aggiorna.tmp /usr/local/bin/aggiorna && sudo chmod a+x /usr/local/bin/aggiorna; then
             SCRIPT_UPDATE='updated ✓'
@@ -731,6 +902,7 @@ fi
 #== Report + exit ===========================================================
 report_card
 printf '\e[?25h'
-read -r -p "$(printf '   %s↵ Press ENTER to close%s' "$DIM" "$RESET")"
+printf '   %s↵ Press ENTER to close%s' "$DIM" "$RESET"
+ask_read _close
 clear
 # == End of script ==
