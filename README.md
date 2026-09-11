@@ -24,7 +24,17 @@ Lo stesso avviso compare all'avvio del comando, prima ancora che venga chiesta l
 - **Output pulito**: l'output dei comandi è normalmente nascosto durante l'esecuzione; viene mostrato in caso di errore, di domanda o di silenzio prolungato.
 - **Domande interattive**: le domande riconosciute vengono mostrate dopo circa 2 secondi, insieme all'output recente. Conta soprattutto per i **prompt di dpkg sui file di configurazione**: `DEBIAN_FRONTEND=noninteractive` zittisce debconf ma non dpkg, che per un conffile modificato chiede lo stesso e aspetta — e quella domanda esce su *stderr*, non sul canale da cui arriva l'avanzamento. Il riquadro mostra anche le righe precedenti, dove stanno le opzioni (`Y/I/N/O/D/Z`): da sola l'ultima riga non basta per rispondere. Il rilevatore ignora colori e controlli del terminale, conserva la domanda anche se seguono righe vuote e riconosce anche «Press ENTER»/«Premi INVIO». Se dopo circa 45 secondi non arriva nuovo output viene mostrato comunque il contesto recente, in silenzio (il campanello suona solo per le domande vere): un comando lento non è necessariamente bloccato, quindi **rispondi solo se c'è una richiesta esplicita, altrimenti attendi**. Nessuna risposta viene inviata automaticamente. Le domande poste dallo script stesso vengono stampate direttamente, senza `read -p`, e la risposta viene letta dal terminale.
 - **Autenticazione**: la password viene chiesta all'inizio; i comandi privilegiati usano `sudo -n`, così un'eventuale scadenza delle credenziali non apre una richiesta di password nascosta sotto il disegno della pipeline.
-- **Scheda di resoconto** finale con operazioni riuscite, tempo impiegato, spazio liberato su disco ed esito dell'autoaggiornamento dello script.
+- **Avviso di riavvio**: a fine giro lo script dice se serve riavviare e **perché**, e lo propone. I segnali guardati sono tre: il file `/run/reboot-required` (scritto da `update-notifier-common`/`needrestart`, che però possono non essere installati), un kernel installato diverso da quello in esecuzione, e i pacchetti core (libc6, systemd, udev, dbus…) riscritti dopo l'avvio. Nessun avviso a vuoto: uno che compare dopo ogni aggiornamento è uno che si impara a ignorare.
+- **Scheda di resoconto** finale con operazioni riuscite, tempo impiegato, spazio liberato su disco, necessità di riavvio ed esito dell'autoaggiornamento dello script.
+- **Flatpak con delta rotti**: quando Flathub distribuisce un delta statico fuori misura il pull muore a metà e l'errore si ripete identico a ogni tentativo; quel singolo ref viene rilanciato da solo con `--no-static-deltas` — più banda, ma l'aggiornamento passa.
+
+## Se qualcosa si pianta
+
+```sh
+AGGIORNA_DEBUG=1 aggiorna
+```
+
+Tiene un diario in `/tmp/aggiorna-debug-<pid>/`: una riga con l'ora a ogni passo e a ogni domanda (con la risposta data), più l'output completo di ogni comando, che di norma viene buttato via. Se lo script si ferma, l'ultima riga del diario dice esattamente dove era arrivato e da quanto tempo era lì. Il percorso viene stampato anche a fine esecuzione.
 
 ## Test locali
 

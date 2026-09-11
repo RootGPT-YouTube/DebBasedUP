@@ -43,7 +43,7 @@ class PromptTests(unittest.TestCase):
         )
         # Fail closed if any test accidentally reaches a real system command.
         for name in (
-            "sudo", "apt-get", "apt", "dpkg", "flatpak", "curl",
+            "sudo", "apt-get", "apt", "dpkg", "dpkg-query", "flatpak", "curl",
             "systemctl", "cromup",
         ):
             self.command(
@@ -327,6 +327,65 @@ QUIET_TICKS=5
             run_apt Test-apt-fail Install 1 0 300 300 1000 mock-fail
             (( steps_ok == 0 && steps_fail == 2 ))
         """)
+
+    def test_flatpak_delta_retry(self):
+        """Flathub manda delta statici fuori misura e il pull muore a meta': quel
+        ref va rilanciato con --no-static-deltas, una volta sola."""
+        self.command("flatpak", """
+            printf '%s\\n' "$*" >> "$TEST_ROOT/flatpak-args"
+            if [[ $* != *--no-static-deltas* ]]; then
+                printf 'Decompressed delta part exceeds configured limit\\n'
+                exit 1
+            fi
+            printf '100%%\\n'
+        """)
+        self.bash("""
+            run_flatpak Test-delta update 0 1000 org.example.Mock
+            (( steps_ok == 1 && steps_fail == 0 ))
+        """)
+        args = (self.root / "flatpak-args").read_text().splitlines()
+        self.assertEqual(len(args), 2, args)
+        self.assertNotIn("--no-static-deltas", args[0])
+        self.assertIn("--no-static-deltas", args[1])
+
+    def test_reboot_reason_from_a_newer_kernel(self):
+        self.command("dpkg-query", r"""
+            printf 'linux-image-99.0.0-1-amd64\n'
+        """)
+        output = self.bash("""
+            detect_reboot_needed || true
+            printf '%s\\n' "${REBOOT_REASONS[@]}"
+        """)
+        self.assertIn("new kernel installed: 99.0.0-1-amd64", output)
+
+    def test_no_reboot_reason_when_the_running_kernel_is_the_newest(self):
+        """Un avviso di riavvio che compare sempre e' un avviso che si impara a
+        ignorare: qui il kernel installato e' quello in esecuzione."""
+        self.command("dpkg-query", r"""
+            printf 'linux-image-%s\n' "$(uname -r)"
+        """)
+        output = self.bash("""
+            detect_reboot_needed || true
+            printf '%s\\n' "${REBOOT_REASONS[@]}"
+        """)
+        self.assertNotIn("new kernel installed", output)
+
+    def test_debug_diary_records_every_step(self):
+        """Senza diario, di uno stallo non resta traccia: e' cosi' che su Fedora
+        era rimasto invisibile per settimane."""
+        self.command("mock-hook", "printf 'output del passo\\n'")
+        self.bash("""
+            DEBUG_DIR=$TEST_ROOT/diario
+            mkdir -p "$DEBUG_DIR"
+            run_step Test-diario mock-hook
+            (( steps_ok == 1 ))
+        """)
+        diary = (self.root / "diario" / "diario.txt").read_text()
+        self.assertIn("inizio: Test-diario", diary)
+        self.assertIn("fine:   Test-diario", diary)
+        # l'output del passo, che di norma viene buttato, qui resta
+        kept = (self.root / "diario" / "Test-diario.log").read_text()
+        self.assertIn("output del passo", kept)
 
     def test_script_questions_never_use_read_p(self):
         """`read -p` stampa il prompt solo se il *suo* stdin e' un terminale, e

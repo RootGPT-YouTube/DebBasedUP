@@ -22,6 +22,7 @@ steps_ok=0
 steps_fail=0
 SCRIPT_UPDATE='—'
 FIRST_STEP=1
+REBOOT_REASONS=()   # why a reboot is needed, filled by detect_reboot_needed
 
 # The TOTAL bar runs on a fixed 0..1000 per-mille scale split into three phase
 # bands — download / install / flatpak — weighted 30/40/30 of the whole bar
@@ -51,6 +52,37 @@ SPIN=('◜' '◠' '◝' '◞' '◡' '◟')   # rotating arc (not braille!)
 # Terminal geometry for the fixed TOTAL footer (bottom 2 reserved rows)
 TERM_ROWS=24
 TERM_COLS=80
+
+#== Diario di bordo (facoltativo) ===========================================
+# `AGGIORNA_DEBUG=1 aggiorna` tiene un diario in /tmp/aggiorna-debug-<pid>/:
+# una riga con l'ora a ogni passo e a ogni domanda, più l'output completo di
+# ogni comando, che di norma viene buttato via appena il passo finisce.
+#
+# Serve per una cosa sola, ma importante: quando lo script *sembra* fermo e lo
+# schermo non dice perché, il diario dice a che punto era arrivato, a che ora, e
+# che cosa stava aspettando. Senza, di un blocco non resta alcuna traccia — ed è
+# così che su Fedora è stato trovato uno stallo che durava da settimane.
+DEBUG_DIR=''
+if [ -n "${AGGIORNA_DEBUG:-}" ]; then
+    DEBUG_DIR="/tmp/aggiorna-debug-$$"
+    mkdir -p "$DEBUG_DIR" 2>/dev/null || DEBUG_DIR=''
+fi
+
+trace() {
+    [ -n "$DEBUG_DIR" ] || return 0
+    printf '%s  %s\n' "$(date '+%H:%M:%S')" "$1" >> "$DEBUG_DIR/diario.txt"
+}
+
+# Fine di un passo: butta il log com'e' sempre stato, ma se il diario e' attivo
+# lo conserva prima, con il nome del passo.
+drop_log() {
+    local log=$1 label=$2
+    if [ -n "$DEBUG_DIR" ] && [ -s "$log" ]; then
+        cp "$log" "$DEBUG_DIR/$(printf '%s' "$label" | tr -c 'A-Za-z0-9._-' '_').log" 2>/dev/null
+    fi
+    trace "fine:   $label"
+    rm -f "$log"
+}
 
 #== Utilities ================================================================
 
@@ -279,6 +311,7 @@ is_question() {
 
 ask_begin() {
     local label="$1" text="$2" kind="${3:-question}" line
+    trace "attesa: $label ($kind)"
     (( LIVE_DRAWN )) && printf '\e[%dA' "$LIVE_LINES"
     LIVE_DRAWN=0
     # Solo una domanda vera suona: il ripiego sul silenzio non deve trasformare
@@ -343,6 +376,7 @@ poll_prompt() {
 run_step() {
     local label="$1"; shift
     local log; log=$(mktemp)
+    trace "inizio: $label"
     connector
     # <&0 is not decoration: bash gives an asynchronous command /dev/null for
     # stdin, so without it the command would hit EOF the moment it asked
@@ -382,7 +416,7 @@ run_step() {
         steps_fail=$(( steps_fail + 1 ))
         error_box "$log"
     fi
-    rm -f "$log"
+    drop_log "$log" "$label"
 }
 
 #== Planning: resolve every section up-front so the TOTAL is known ============
@@ -511,12 +545,13 @@ run_apt() {
     local label="$1" p2="$2" pkg="$3" dl_lo="$4" dl_hi="$5" in_lo="$6" in_hi="$7"; shift 7
     local cmd=("$@")
     local log; log=$(mktemp)
+    trace "inizio: $label"
     connector
 
     if (( pkg == 0 )); then
         render_live "${SPIN[0]}" "$label" '00:00' 'nothing to do' 1 1
         draw_total_footer "$in_hi"
-        finish_node '●' "$GREEN" "$label"; steps_ok=$(( steps_ok + 1 )); rm -f "$log"; return
+        finish_node '●' "$GREEN" "$label"; steps_ok=$(( steps_ok + 1 )); drop_log "$log" "$label"; return
     fi
 
     # Run the transaction; on a broken/interrupted failure, auto-repair with
@@ -630,7 +665,28 @@ run_apt() {
     else
         finish_node '✗' "$RED" "$label"; steps_fail=$(( steps_fail + 1 )); error_box "$log"
     fi
-    rm -f "$log"
+    drop_log "$log" "$label"
+}
+
+# Vero se l'ultima passata di `flatpak update` (le righe del log dopo la riga
+# numero $2) e' morta sui delta statici del remoto.
+#
+# Un delta statico e' il "pacchetto differenza" che flathub prepara fra due
+# versioni: si scarica al posto dell'intero, ed e' molto piu' leggero. Ostree
+# pero' rifiuta una parte di delta piu' grande del proprio limite
+# (max-delta-part-size / OSTREE_MAX_DELTA_PART_SIZE) e si ferma a meta' pull:
+#
+#   Error: While pulling app/com.usebottles.bottles/x86_64/stable from remote
+#   flathub: Decompressed delta part exceeds configured limit of 4537824 bytes
+#
+# Non e' un guasto del sistema locale ne' della rete: e' quel delta a essere
+# fuori misura, e resta rotto a ogni tentativo finche' flathub non lo rigenera.
+# La via d'uscita e' --no-static-deltas, che ignora la differenza e si porta
+# giu' gli oggetti interi: piu' banda, ma l'aggiornamento passa.
+flatpak_delta_failure() {
+    local log=$1 mark=$2
+    tail -n "+$(( mark + 1 ))" "$log" 2>/dev/null |
+        grep -Eqi 'delta (part|superblock)|static delta|delta.*(exceed|invalid|corrupt)'
 }
 
 #== Flatpak section: update or remove one ref at a time ======================
@@ -640,6 +696,7 @@ run_flatpak() {
     local label="$1" mode="$2" lo="$3" hi="$4"; shift 4
     local refs=("$@") N=$#
     local log; log=$(mktemp)
+    trace "inizio: $label"
     connector
 
     local verb; [[ $mode == update ]] && verb=Update || verb=Remove
@@ -647,50 +704,65 @@ run_flatpak() {
     if (( N == 0 )); then
         render_live "${SPIN[0]}" "$label" '00:00' 'nothing to do' 1 1
         draw_total_footer "$hi"
-        finish_node '●' "$GREEN" "$label"; steps_ok=$(( steps_ok + 1 )); rm -f "$log"; return
+        finish_node '●' "$GREEN" "$label"; steps_ok=$(( steps_ok + 1 )); drop_log "$log" "$label"; return
     fi
 
     local rc=0 start=$SECONDS i=0 idx=0 ref
     for ref in "${refs[@]}"; do
         idx=$(( idx + 1 ))
-        local cur_pct=0 lrc=0 fd
-        if [[ $mode == update ]]; then
-            exec {fd}< <( { "${UNBUF[@]}" env LC_ALL=C flatpak update -y "$ref"; printf '\n__RC__%d__\n' "$?"; } 2>&1 )
-        else
-            exec {fd}< <( { "${UNBUF[@]}" env LC_ALL=C flatpak uninstall -y "$ref"; printf '\n__RC__%d__\n' "$?"; } 2>&1 )
-        fi
-        local pending='' stall=0 asking=0 last_line='' line
+        # Un ref puo' richiedere due passate: la seconda e' il ritiro dei delta
+        # statici (vedi flatpak_delta_failure), e riparte da capo col flag in piu'.
+        local lrc=0 attempt=1 extra=() note='' mark=0
         while true; do
-            line=''
-            if IFS= read -t 0.12 -r -u "$fd" line; then
-                (( asking )) && { ask_end; asking=0; }
-                [[ -n $pending ]] && { line="$pending$line"; pending=''; }
-                stall=0
-                case "$line" in __RC__*__) lrc=${line#__RC__}; lrc=${lrc%__}; continue;; esac
-                printf '%s\n' "$line" >>"$log"
-                remember_prompt_line "$line" last_line
-                [[ $line =~ ([0-9]+)%[^0-9]*$ ]] && cur_pct=${BASH_REMATCH[1]}
+            local cur_pct=0 fd
+            lrc=0
+            mark=$(wc -l <"$log")
+            if [[ $mode == update ]]; then
+                exec {fd}< <( { "${UNBUF[@]}" env LC_ALL=C flatpak update -y "${extra[@]}" "$ref"; printf '\n__RC__%d__\n' "$?"; } 2>&1 )
             else
-                (( $? > 128 )) || break
-                # timeout: read leaves any newline-less partial input in $line —
-                # a line that then stays unfinished is a prompt awaiting an answer
-                if [[ -n $line ]]; then
-                    (( asking )) && { ask_end; asking=0; }
-                    pending+="$line"; stall=0
-                else
-                    poll_prompt "$label" pending stall asking last_line "$log"
-                fi
+                exec {fd}< <( { "${UNBUF[@]}" env LC_ALL=C flatpak uninstall -y "$ref"; printf '\n__RC__%d__\n' "$?"; } 2>&1 )
             fi
-            (( asking )) && continue           # UI frozen while the user answers
-            local sd=$(( (idx - 1) * 1000 + cur_pct * 10 ))
-            render_live "${SPIN[i%6]}" "$label" "$(fmt_time $(( SECONDS - start )))" \
-                "$verb $idx/$N: $ref" "$sd" "$(( N * 1000 ))"
-            draw_total_footer $(( lo + (hi - lo) * sd / (N * 1000) ))
-            i=$(( i + 1 ))
+            local pending='' stall=0 asking=0 last_line='' line
+            while true; do
+                line=''
+                if IFS= read -t 0.12 -r -u "$fd" line; then
+                    (( asking )) && { ask_end; asking=0; }
+                    [[ -n $pending ]] && { line="$pending$line"; pending=''; }
+                    stall=0
+                    case "$line" in __RC__*__) lrc=${line#__RC__}; lrc=${lrc%__}; continue;; esac
+                    printf '%s\n' "$line" >>"$log"
+                    remember_prompt_line "$line" last_line
+                    [[ $line =~ ([0-9]+)%[^0-9]*$ ]] && cur_pct=${BASH_REMATCH[1]}
+                else
+                    (( $? > 128 )) || break
+                    # timeout: read leaves any newline-less partial input in $line —
+                    # a line that then stays unfinished is a prompt awaiting an answer
+                    if [[ -n $line ]]; then
+                        (( asking )) && { ask_end; asking=0; }
+                        pending+="$line"; stall=0
+                    else
+                        poll_prompt "$label" pending stall asking last_line "$log"
+                    fi
+                fi
+                (( asking )) && continue           # UI frozen while the user answers
+                local sd=$(( (idx - 1) * 1000 + cur_pct * 10 ))
+                render_live "${SPIN[i%6]}" "$label" "$(fmt_time $(( SECONDS - start )))" \
+                    "$verb $idx/$N: $ref$note" "$sd" "$(( N * 1000 ))"
+                draw_total_footer $(( lo + (hi - lo) * sd / (N * 1000) ))
+                i=$(( i + 1 ))
+            done
+            exec {fd}<&-
+            (( asking )) && { ask_end; asking=0; }
+            [[ -n $pending ]] && printf '%s\n' "$pending" >>"$log"
+
+            (( lrc == 0 || attempt > 1 )) && break
+            [[ $mode == update ]] || break
+            flatpak_delta_failure "$log" "$mark" || break
+            attempt=2; extra=(--no-static-deltas); note=' (senza delta)'
+            printf '%s\n' "--- ritento senza delta statici: flatpak update -y --no-static-deltas $ref" >>"$log"
+            trace "delta rotto, ritento intero: $ref"
+            cur_pct=0
         done
-        exec {fd}<&-
-        (( asking )) && { ask_end; asking=0; }
-        [[ -n $pending ]] && printf '%s\n' "$pending" >>"$log"
         (( lrc != 0 )) && rc=1
     done
 
@@ -700,7 +772,67 @@ run_flatpak() {
     else
         finish_node '✗' "$RED" "$label"; steps_fail=$(( steps_fail + 1 )); error_box "$log"
     fi
-    rm -f "$log"
+    drop_log "$log" "$label"
+}
+
+#== Reboot detection =========================================================
+# Non e' un port riga per riga da FedoraUP: li' si guardano l'rpmdb e fwupd, qui
+# i segnali sono altri. Il criterio resta lo stesso — dirlo solo quando e' vero.
+# Un avviso di riavvio di cui non ci si puo' fidare e' peggio di nessun avviso:
+# se compare dopo ogni aggiornamento, si impara a ignorarlo.
+
+# Pacchetti il cui aggiornamento non ha effetto finche' i processi in esecuzione
+# non ripartono. Nomi interi, confrontati uno per uno: un "dbus" cercato alla
+# buona pescherebbe anche dbus-x11.
+REBOOT_CORE_PKGS=(libc6 systemd systemd-sysv udev dbus dbus-broker dbus-daemon
+                  libssl3 linux-base)
+
+# Fill REBOOT_REASONS with everything that only takes effect after a restart.
+detect_reboot_needed() {
+    REBOOT_REASONS=()
+
+    # Il segnale canonico del mondo Debian, scritto dai pacchetti stessi
+    # (update-notifier-common, needrestart) quando un aggiornamento richiede un
+    # riavvio. Puo' mancare del tutto se quei pacchetti non sono installati:
+    # e' un indizio in piu', non l'unico — per questo sotto ce ne sono altri due.
+    local flag=''
+    [ -f /run/reboot-required ]     && flag=/run/reboot-required
+    [ -z "$flag" ] && [ -f /var/run/reboot-required ] && flag=/var/run/reboot-required
+    if [ -n "$flag" ]; then
+        local pkgs=''
+        [ -r "${flag}.pkgs" ] && pkgs=$(sort -u "${flag}.pkgs" 2>/dev/null | tr '\n' ' ')
+        pkgs=${pkgs% }
+        if [ -n "$pkgs" ]; then
+            REBOOT_REASONS+=("the system asked for a reboot (packages: $pkgs)")
+        else
+            REBOOT_REASONS+=("the system asked for a reboot ($flag)")
+        fi
+    fi
+
+    # kernel: il piu' recente installato contro quello in esecuzione
+    local newest running
+    running=$(uname -r)
+    newest=$(dpkg-query -W -f='${Package}\n' 'linux-image-[0-9]*' 2>/dev/null |
+             sed 's/^linux-image-//' | sort -V | tail -1)
+    [[ -n $newest && $newest != "$running" ]] && REBOOT_REASONS+=("new kernel installed: $newest")
+
+    # Pacchetti core riscritti dopo l'avvio: i processi in esecuzione tengono
+    # ancora i file vecchi. dpkg non registra l'ora di installazione come fa
+    # rpm con %{INSTALLTIME}, ma riscrive l'elenco dei file del pacchetto a ogni
+    # installazione: la mtime di /var/lib/dpkg/info/<pkg>.list e' l'equivalente.
+    local boot_epoch core='' pkg f mt
+    boot_epoch=$(( $(date +%s) - $(cut -d. -f1 /proc/uptime 2>/dev/null || echo 0) ))
+    for pkg in "${REBOOT_CORE_PKGS[@]}"; do
+        for f in "/var/lib/dpkg/info/$pkg.list" "/var/lib/dpkg/info/$pkg:"*.list; do
+            [ -f "$f" ] || continue                  # il glob multiarch puo' non espandersi
+            mt=$(stat -c %Y "$f" 2>/dev/null || echo 0)
+            (( mt > boot_epoch )) && { core+="$pkg "; break; }
+        done
+    done
+    core=${core% }
+    [[ -n $core ]] && REBOOT_REASONS+=("core packages updated since boot: $core")
+
+    (( ${#REBOOT_REASONS[@]} > 0 ))
 }
 
 #== Domande sì/no poste dallo script stesso ==================================
@@ -730,11 +862,13 @@ ask_read() {
 
 ask_yes_no() {
     local prompt="$1" ans
+    trace "chiedo: $prompt"
     printf '\e[?25h'
     printf '\a'                                   # una domanda si deve anche sentire
     printf '   %s◈%s  %s %s[y/N]%s ' "$GOLD" "$RESET" "$prompt" "$DIM" "$RESET"
     ask_read ans
     printf '\e[?25l'
+    trace "risposta: '$ans'"
     [[ $ans =~ ^([yY]|[yY][eE][sS]|[sS]|[sS][iI])$ ]]
 }
 
@@ -811,6 +945,9 @@ report_card() {
     else
         card_line "Space used"   "$(kb_to_human "$(( -freed ))")" "$GOLD$BOLD"
     fi
+    if (( ${#REBOOT_REASONS[@]} > 0 )); then
+        card_line "Reboot required" "yes" "$GOLD$BOLD"
+    fi
     card_line "Script update" "$SCRIPT_UPDATE"            "$BOLD"
 
     printf '  %s╰%s╯%s\n' "$CYAN" "$rule" "$RESET"
@@ -826,6 +963,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 #== START ===================================================================
+trace "avvio ($(uname -r), $(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-?}"), TERM=${TERM:-?}, stdin tty: $([ -t 0 ] && echo si || echo no))"
 clear
 setup_footer
 header
@@ -879,8 +1017,14 @@ teardown_footer
 printf '   %s┃%s\n' "$DIM" "$RESET"
 printf '   %s⋯  controlli finali e autoaggiornamento…%s\n' "$DIM" "$RESET"
 
+# Everything that only takes effect after a restart (kernel, core libs)
+trace "inizio: analisi riavvio"
+detect_reboot_needed || true
+trace "fine:   analisi riavvio (${#REBOOT_REASONS[@]} motivi)"
+
 # Timeout espliciti: senza, un mirror che non risponde lascia curl appeso a
 # tempo indeterminato proprio qui, dove non si muove piu' niente a schermo.
+trace "inizio: autoaggiornamento"
 if curl -fsSL --connect-timeout 10 --max-time 60 \
         https://raw.githubusercontent.com/RootGPT-YouTube/DebBasedUP/main/aggiorna \
         -o /tmp/aggiorna.tmp 2>/dev/null; then
@@ -898,11 +1042,33 @@ else
     rm -f /tmp/aggiorna.tmp
     SCRIPT_UPDATE='not checked'
 fi
+trace "fine:   autoaggiornamento ($SCRIPT_UPDATE)"
 
-#== Report + exit ===========================================================
+#== Report ==================================================================
 report_card
+
+#== Reboot-class updates ====================================================
+if (( ${#REBOOT_REASONS[@]} > 0 )); then
+    printf '   %s⟳  A REBOOT IS REQUIRED to complete this update:%s\n' "$GOLD$BOLD" "$RESET"
+    for reason in "${REBOOT_REASONS[@]}"; do
+        printf '      %s•%s %s\n' "$GOLD" "$RESET" "$reason"
+    done
+    echo
+    if ask_yes_no "Reboot now?"; then
+        printf '\n   %sRebooting…%s\n' "$DIM" "$RESET"
+        trace "riavvio richiesto dall'utente"
+        sudo systemctl reboot || sudo reboot
+        exit 0
+    fi
+    printf '      %sRemember to reboot to finish applying the update.%s\n\n' "$DIM" "$RESET"
+fi
+
+#== Exit ====================================================================
+trace "uscita normale"
+[ -n "$DEBUG_DIR" ] && printf '   %sDiario di questa esecuzione: %s%s\n' "$DIM" "$DEBUG_DIR" "$RESET"
 printf '\e[?25h'
 printf '   %s↵ Press ENTER to close%s' "$DIM" "$RESET"
 ask_read _close
 clear
+[ -n "$DEBUG_DIR" ] && printf 'Diario di aggiorna: %s\n' "$DEBUG_DIR"
 # == End of script ==
