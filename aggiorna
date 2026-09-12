@@ -439,12 +439,50 @@ apt_count() {
 }
 
 # list Flatpak refs needing an update (mode=update) or that are unused (mode=unused)
+#
+# Per l'elenco degli aggiornamenti `flatpak update --no-deploy` sembrava la via
+# naturale, ma e' una via che fa domande. Se un'app passa a un runtime che qui
+# non c'e' ancora, prima di elencare qualsiasi cosa chiede:
+#
+#   Required runtime for org.kde.ktorrent/x86_64/stable
+#   (runtime/org.kde.Platform/x86_64/6.11) found in remote flathub
+#   Do you want to install it? [Y/n]:
+#
+# Nessuno risponde (qui si sta solo guardando, non aggiornando) e flatpak
+# abortisce l'intero elenco, non solo quel ref. Sul gemello Fedora bastava un
+# KTorrent che cambia runtime perche' il passo dicesse "nothing to do" con
+# dodici aggiornamenti in coda: difetto visto sul campo il 12 set 2026, e
+# invisibile proprio perche' il passo restava verde.
+#
+# `remote-ls --updates` interroga il remoto e basta: non installa niente,
+# quindi non ha niente da chiedere. Un ref completo per riga, gli stessi che
+# mostra il centro software. Le estensioni (i .Locale) restano fuori
+# dall'elenco perche' `flatpak update` se le porta dietro insieme all'app che
+# le possiede.
+#
+# Nota per chi tiene allineati i due script: questa parte non ha niente di
+# specifico di Fedora o di Debian. Flatpak e' lo stesso di qua e di la'.
 flatpak_refs() {
     if [[ $1 == update ]]; then
-        env LC_ALL=C flatpak update --no-deploy 2>/dev/null
+        env LC_ALL=C flatpak remote-ls --updates --columns=ref 2>/dev/null |
+            awk 'NF && !seen[$0]++'
     else
-        printf 'n\n' | env LC_ALL=C flatpak uninstall --unused 2>/dev/null
-    fi | awk -F'\t' '/^[[:space:]]*[0-9]+\./ { gsub(/^[ \t]+|[ \t]+$/,"",$3); if ($3!="") print $3 }'
+        printf 'n\n' | env LC_ALL=C flatpak uninstall --unused 2>/dev/null |
+            awk -F'\t' '/^[[:space:]]*[0-9]+\./ { gsub(/^[ \t]+|[ \t]+$/,"",$3); if ($3!="") print $3 }'
+    fi
+}
+
+# Un ref completo e' esatto ma illeggibile di corsa: sulla riga di avanzamento
+# ne basta il nome, con la branch solo quando dice qualcosa.
+#   app/org.kde.kdenlive/x86_64/stable   -> org.kde.kdenlive
+#   runtime/org.kde.Platform/x86_64/6.10 -> org.kde.Platform 6.10
+ref_label() {
+    local kind id arch branch
+    IFS=/ read -r kind id arch branch <<<"$1"
+    if [[ -z $branch ]]; then printf '%s' "$1"
+    elif [[ $branch == stable ]]; then printf '%s' "$id"
+    else printf '%s %s' "$id" "$branch"
+    fi
 }
 
 plan_phase() {
@@ -713,6 +751,7 @@ run_flatpak() {
         # Un ref puo' richiedere due passate: la seconda e' il ritiro dei delta
         # statici (vedi flatpak_delta_failure), e riparte da capo col flag in piu'.
         local lrc=0 attempt=1 extra=() note='' mark=0
+        local shown; shown=$(ref_label "$ref")
         while true; do
             local cur_pct=0 fd
             lrc=0
@@ -747,7 +786,7 @@ run_flatpak() {
                 (( asking )) && continue           # UI frozen while the user answers
                 local sd=$(( (idx - 1) * 1000 + cur_pct * 10 ))
                 render_live "${SPIN[i%6]}" "$label" "$(fmt_time $(( SECONDS - start )))" \
-                    "$verb $idx/$N: $ref$note" "$sd" "$(( N * 1000 ))"
+                    "$verb $idx/$N: $shown$note" "$sd" "$(( N * 1000 ))"
                 draw_total_footer $(( lo + (hi - lo) * sd / (N * 1000) ))
                 i=$(( i + 1 ))
             done

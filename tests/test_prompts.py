@@ -403,6 +403,47 @@ QUIET_TICKS=5
         self.assertIn("Accetti e vuoi continuare?", output)
         self.assertIn("SI", output)
 
+    def test_flatpak_update_list_survives_a_new_runtime(self):
+        """Quando un'app passa a un runtime non ancora installato, `flatpak
+        update` prima di elencare qualsiasi cosa chiede se installarlo; in fase
+        di sola lettura nessuno risponde e l'elenco intero viene abortito. Visto
+        sul campo sul gemello Fedora il 12 set 2026: KTorrent chiedeva
+        org.kde.Platform 6.11 e il passo diceva "nothing to do", verde, con
+        dodici aggiornamenti in coda. Flatpak e' lo stesso di qua e di la'."""
+        self.command("flatpak", r"""
+            if [[ $1 == remote-ls ]]; then
+                printf 'app/com.brave.Browser/x86_64/stable
+'
+                printf 'app/org.kde.ktorrent/x86_64/stable
+'
+                printf 'runtime/org.kde.Platform/x86_64/6.10
+'
+                printf 'app/com.brave.Browser/x86_64/stable
+'   # doppione: un ref in due remoti
+                exit 0
+            fi
+            # la via che faceva domande: nessuno risponde, l'elenco muore qui
+            printf 'Required runtime for org.kde.ktorrent/x86_64/stable found in remote flathub
+'
+            printf 'Do you want to install it? [Y/n]: '
+            IFS= read -r _answer
+            printf 'error: requires the runtime org.kde.Platform/x86_64/6.11
+' >&2
+            exit 1
+        """)
+        output = self.bash("""
+            flatpak_refs update
+            printf 'LABEL=<%s>\n' "$(ref_label runtime/org.kde.Platform/x86_64/6.10)"
+            printf 'LABEL=<%s>\n' "$(ref_label app/com.brave.Browser/x86_64/stable)"
+        """)
+        self.assertEqual(
+            [line for line in output.splitlines() if not line.startswith("LABEL=")],
+            ["app/com.brave.Browser/x86_64/stable",
+             "app/org.kde.ktorrent/x86_64/stable",
+             "runtime/org.kde.Platform/x86_64/6.10"])
+        self.assertIn("LABEL=<org.kde.Platform 6.10>", output)
+        self.assertIn("LABEL=<com.brave.Browser>", output)
+
     def test_main_apt_calls_keep_command_argument_positions(self):
         prefix = ('sudo -n "${UNBUF[@]}" env LC_ALL=C '
                   'DEBIAN_FRONTEND=noninteractive apt-get -y -q '
