@@ -460,12 +460,18 @@ apt_count() {
 # dall'elenco perche' `flatpak update` se le porta dietro insieme all'app che
 # le possiede.
 #
+# Senza `--all`, pero', remote-ls tace anche i ref a fine vita. Un runtime EOL
+# non smette di ricevere commit: sul gemello Fedora freedesktop Platform 24.08
+# ne aveva uno nuovo il 5 ott 2026, ancora in uso da RustDesk e TigerVNC, e il
+# centro software lo mostrava mentre `aggiorna` lo saltava. Con `--all` arrivano
+# anche .Locale, .Debug e .Sources, che qui si scartano a mano.
+#
 # Nota per chi tiene allineati i due script: questa parte non ha niente di
 # specifico di Fedora o di Debian. Flatpak e' lo stesso di qua e di la'.
 flatpak_refs() {
     if [[ $1 == update ]]; then
-        env LC_ALL=C flatpak remote-ls --updates --columns=ref 2>/dev/null |
-            awk 'NF && !seen[$0]++'
+        env LC_ALL=C flatpak remote-ls --updates --all --columns=ref 2>/dev/null |
+            awk -F/ 'NF && $2 !~ /\.(Locale|Debug|Sources)$/ && !seen[$0]++'
     else
         printf 'n\n' | env LC_ALL=C flatpak uninstall --unused 2>/dev/null |
             awk -F'\t' '/^[[:space:]]*[0-9]+\./ { gsub(/^[ \t]+|[ \t]+$/,"",$3); if ($3!="") print $3 }'

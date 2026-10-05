@@ -444,6 +444,30 @@ QUIET_TICKS=5
         self.assertIn("LABEL=<org.kde.Platform 6.10>", output)
         self.assertIn("LABEL=<com.brave.Browser>", output)
 
+    def test_flatpak_update_list_includes_end_of_life_runtimes(self):
+        """Senza `--all` remote-ls nasconde i ref a fine vita, che pero'
+        continuano a ricevere commit. Il caso reale, sul gemello Fedora
+        (5 ott 2026): Discover mostrava freedesktop Platform 24.08 e i suoi
+        GL.default, `aggiorna` no. Con `--all` arrivano anche le estensioni,
+        che vanno scartate."""
+        self.command("flatpak", r"""
+            [[ $1 == remote-ls ]] || exit 1
+            printf 'app/com.brave.Browser/x86_64/stable\n'
+            if [[ " $* " == *" --all "* || " $* " == *" -a "* ]]; then
+                printf 'runtime/org.freedesktop.Platform.GL.default/x86_64/24.08\n'
+                printf 'runtime/org.freedesktop.Platform.Locale/x86_64/24.08\n'
+                printf 'runtime/org.freedesktop.Platform/x86_64/24.08\n'
+                printf 'runtime/org.freedesktop.Platform.Debug/x86_64/24.08\n'
+                printf 'runtime/com.brave.Browser.Locale/x86_64/stable\n'
+            fi
+        """)
+        output = self.bash("flatpak_refs update")
+        self.assertEqual(
+            output.splitlines(),
+            ["app/com.brave.Browser/x86_64/stable",
+             "runtime/org.freedesktop.Platform.GL.default/x86_64/24.08",
+             "runtime/org.freedesktop.Platform/x86_64/24.08"])
+
     def test_main_apt_calls_keep_command_argument_positions(self):
         prefix = ('sudo -n "${UNBUF[@]}" env LC_ALL=C '
                   'DEBIAN_FRONTEND=noninteractive apt-get -y -q '
