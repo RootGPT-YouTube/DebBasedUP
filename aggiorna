@@ -473,8 +473,23 @@ flatpak_refs() {
         env LC_ALL=C flatpak remote-ls --updates --all --columns=ref 2>/dev/null |
             awk -F/ 'NF && $2 !~ /\.(Locale|Debug|Sources)$/ && !seen[$0]++'
     else
-        printf 'n\n' | env LC_ALL=C flatpak uninstall --unused 2>/dev/null |
-            awk -F'\t' '/^[[:space:]]*[0-9]+\./ { gsub(/^[ \t]+|[ \t]+$/,"",$3); if ($3!="") print $3 }'
+        # `uninstall --unused` elenca id e branch su colonne separate. Passare
+        # a `flatpak uninstall` il solo id e' ambiguo appena ne sono installate
+        # piu' branch (org.kde.Platform.Locale 6.10, 6.11, 5.15-25.08): flatpak
+        # chiede quale togliere, nessuno risponde e il ref resta li'. Scegliere
+        # "la piu' recente" sarebbe peggio: e' quella in uso. Il ref completo
+        # si ricostruisce da `flatpak list`, che ha anche l'arch.
+        local wanted
+        wanted=$(printf 'n\n' | env LC_ALL=C flatpak uninstall --unused 2>/dev/null |
+            awk -F'\t' '/^[[:space:]]*[0-9]+\./ {
+                for (i = 3; i <= 4; i++) gsub(/^[ \t]+|[ \t]+$/, "", $i)
+                if ($3 != "") print $3 "\t" $4 }')
+        [[ -n $wanted ]] || return 0
+        env LC_ALL=C flatpak list --runtime --all --columns=ref 2>/dev/null |
+            awk -F/ -v wanted="$wanted" '
+                BEGIN { n = split(wanted, w, "\n")
+                        for (i = 1; i <= n; i++) { split(w[i], p, "\t"); want[p[1] SUBSEP p[2]] = 1 } }
+                NF == 3 && (($1 SUBSEP $3) in want) && !seen[$0]++ { print "runtime/" $0 }'
     fi
 }
 
@@ -758,6 +773,17 @@ run_flatpak() {
         # statici (vedi flatpak_delta_failure), e riparte da capo col flag in piu'.
         local lrc=0 attempt=1 extra=() note='' mark=0
         local shown; shown=$(ref_label "$ref")
+        # Togliere un runtime si porta dietro le sue estensioni: uninstall di
+        # org.kde.Platform 6.10 rimuove anche Platform.Locale 6.10, che pero'
+        # e' ancora piu' avanti nell'elenco. Al suo turno flatpak risponde "No
+        # installed refs found" ed esce con 1, e il passo diventava rosso dopo
+        # aver fatto esattamente quello che doveva. Chi e' gia' sparito e'
+        # gia' rimosso: si salta.
+        if [[ $mode == remove ]] && ! env LC_ALL=C flatpak info "$ref" >/dev/null 2>&1; then
+            printf '%s\n' "--- gia' rimosso insieme a un ref precedente: $ref" >>"$log"
+            trace "gia' rimosso: $ref"
+            continue
+        fi
         while true; do
             local cur_pct=0 fd
             lrc=0

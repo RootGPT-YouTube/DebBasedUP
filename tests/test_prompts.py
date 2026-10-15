@@ -304,6 +304,7 @@ QUIET_TICKS=5
 
     def test_flatpak_update_and_remove_prompts(self):
         self.command("flatpak", r"""
+            [[ $1 == info ]] && exit 0     # il ref c'e' ancora
             printf '\033[33mPress ENTER to continue\033[0m\n\n'
             IFS= read -r answer
             printf 'ANSWER=<%s>\n' "$answer" >> "$TEST_ROOT/answers"
@@ -467,6 +468,58 @@ QUIET_TICKS=5
             ["app/com.brave.Browser/x86_64/stable",
              "runtime/org.freedesktop.Platform.GL.default/x86_64/24.08",
              "runtime/org.freedesktop.Platform/x86_64/24.08"])
+
+    def test_flatpak_remove_skips_refs_already_taken_with_their_runtime(self):
+        """Togliere org.kde.Platform 6.10 si porta via anche la sua .Locale,
+        che pero' e' piu' avanti nell'elenco: al suo turno flatpak diceva "No
+        installed refs found" e il passo finiva rosso dopo aver fatto tutto
+        (caso reale, 15 ott 2026)."""
+        self.command("flatpak", r"""
+            state="$TEST_ROOT/installed"
+            [[ -e $state ]] || printf 'runtime/org.kde.Platform/x86_64/6.10\nruntime/org.kde.Platform.Locale/x86_64/6.10\n' >"$state"
+            if [[ $1 == info ]]; then grep -qxF "$2" "$state"; exit; fi
+            [[ $1 == uninstall ]] || exit 1
+            ref=${!#}
+            printf '%s\n' "$ref" >> "$TEST_ROOT/uninstalled"
+            grep -qxF "$ref" "$state" || {
+                printf 'error: No installed refs found for %s\n' "$ref" >&2; exit 1; }
+            # come flatpak: il runtime se ne va con le sue estensioni
+            grep -vF "${ref%/*/*}" "$state" >"$state.new"; mv "$state.new" "$state"
+            printf 'Uninstall complete.\n'
+        """)
+        self.bash("""
+            run_flatpak Test-unused remove 0 1000 \
+                runtime/org.kde.Platform/x86_64/6.10 \
+                runtime/org.kde.Platform.Locale/x86_64/6.10
+            (( steps_ok == 1 && steps_fail == 0 ))
+        """)
+        self.assertEqual(
+            (self.root / "uninstalled").read_text().splitlines(),
+            ["runtime/org.kde.Platform/x86_64/6.10"])
+
+    def test_flatpak_unused_list_gives_full_refs(self):
+        """`uninstall --unused` mostra id e branch separati: col solo id
+        flatpak chiedeva quale fra le Locale 6.10, 6.11 e 5.15-25.08
+        togliere e la rimozione abortiva (caso reale, 15 ott 2026)."""
+        self.command("flatpak", r"""
+            if [[ $1 == uninstall ]]; then
+                printf '\n\n 1.\t   \torg.kde.Platform\t6.10\tr\n'
+                printf ' 2.\t   \torg.kde.Platform.Locale\t6.10\tr\n'
+                printf '\nProceed with these changes to the system installation? [Y/n]: '
+                exit 0
+            fi
+            [[ $1 == list ]] || exit 1
+            printf 'org.kde.Platform/x86_64/6.10\n'
+            printf 'org.kde.Platform/x86_64/6.11\n'
+            printf 'org.kde.Platform.Locale/x86_64/5.15-25.08\n'
+            printf 'org.kde.Platform.Locale/x86_64/6.10\n'
+            printf 'org.kde.Platform.Locale/x86_64/6.11\n'
+        """)
+        output = self.bash("flatpak_refs unused")
+        self.assertEqual(
+            output.splitlines(),
+            ["runtime/org.kde.Platform/x86_64/6.10",
+             "runtime/org.kde.Platform.Locale/x86_64/6.10"])
 
     def test_main_apt_calls_keep_command_argument_positions(self):
         prefix = ('sudo -n "${UNBUF[@]}" env LC_ALL=C '
