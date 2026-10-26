@@ -468,10 +468,29 @@ apt_count() {
 #
 # Nota per chi tiene allineati i due script: questa parte non ha niente di
 # specifico di Fedora o di Debian. Flatpak e' lo stesso di qua e di la'.
+#
+# remote-ls pero' conosce solo cio' che e' gia' installato. Quando un'app
+# cambia runtime, le sue estensioni chiedono la branch nuova: sul gemello
+# Fedora OBS passato a freedesktop 26.08 voleva LinuxAudio.Plugins.CMT 26.08,
+# che li' non c'era (26 ott 2026). Non c'e' niente da aggiornare, c'e' da
+# installare, e il centro software la mostrava come aggiornamento di OBS.
+# Quelle righe le ha solo il piano di `flatpak update`, con la `i` nella
+# colonna dell'operazione: si leggono rispondendo "n". Se il piano si ferma
+# sulla domanda del runtime mancante (vedi sopra) queste righe mancano, ma
+# l'elenco di remote-ls resta intero.
 flatpak_refs() {
     if [[ $1 == update ]]; then
         env LC_ALL=C flatpak remote-ls --updates --all --columns=ref 2>/dev/null |
             awk -F/ 'NF && $2 !~ /\.(Locale|Debug|Sources)$/ && !seen[$0]++'
+        local missing
+        missing=$(printf 'n\n' | env LC_ALL=C flatpak update 2>/dev/null |
+            awk -F'\t' '/^[[:space:]]*[0-9]+\./ {
+                for (i = 3; i <= 5; i++) gsub(/^[ \t]+|[ \t]+$/, "", $i)
+                if ($3 != "" && $5 == "i" && $3 !~ /\.(Debug|Sources)$/) print $3 "/" $4 }')
+        [[ -n $missing ]] || return 0
+        local arch; arch=$(flatpak --default-arch 2>/dev/null) || return 0
+        [[ -n $arch ]] || return 0
+        awk -F/ -v arch="$arch" 'NF == 2 && !seen[$0]++ { print "runtime/" $1 "/" arch "/" $2 }' <<<"$missing"
     else
         # `uninstall --unused` elenca id e branch su colonne separate. Passare
         # a `flatpak uninstall` il solo id e' ambiguo appena ne sono installate
@@ -758,8 +777,6 @@ run_flatpak() {
     trace "inizio: $label"
     connector
 
-    local verb; [[ $mode == update ]] && verb=Update || verb=Remove
-
     if (( N == 0 )); then
         render_live "${SPIN[0]}" "$label" '00:00' 'nothing to do' 1 1
         draw_total_footer "$hi"
@@ -784,12 +801,20 @@ run_flatpak() {
             trace "gia' rimosso: $ref"
             continue
         fi
+        # Le estensioni che mancano (vedi flatpak_refs) non sono installate e
+        # `flatpak update` le rifiuta: per loro serve install. Se un ref
+        # precedente se l'e' gia' portata dietro, update non ha niente da fare.
+        local op=$mode
+        if [[ $mode == update ]] && ! env LC_ALL=C flatpak info "$ref" >/dev/null 2>&1; then
+            op=install
+            printf '%s\n' "--- non ancora installato: flatpak install -y $ref" >>"$log"
+        fi
         while true; do
             local cur_pct=0 fd
             lrc=0
             mark=$(wc -l <"$log")
             if [[ $mode == update ]]; then
-                exec {fd}< <( { "${UNBUF[@]}" env LC_ALL=C flatpak update -y "${extra[@]}" "$ref"; printf '\n__RC__%d__\n' "$?"; } 2>&1 )
+                exec {fd}< <( { "${UNBUF[@]}" env LC_ALL=C flatpak "$op" -y "${extra[@]}" "$ref"; printf '\n__RC__%d__\n' "$?"; } 2>&1 )
             else
                 exec {fd}< <( { "${UNBUF[@]}" env LC_ALL=C flatpak uninstall -y "$ref"; printf '\n__RC__%d__\n' "$?"; } 2>&1 )
             fi
@@ -818,7 +843,7 @@ run_flatpak() {
                 (( asking )) && continue           # UI frozen while the user answers
                 local sd=$(( (idx - 1) * 1000 + cur_pct * 10 ))
                 render_live "${SPIN[i%6]}" "$label" "$(fmt_time $(( SECONDS - start )))" \
-                    "$verb $idx/$N: $shown$note" "$sd" "$(( N * 1000 ))"
+                    "${op^} $idx/$N: $shown$note" "$sd" "$(( N * 1000 ))"
                 draw_total_footer $(( lo + (hi - lo) * sd / (N * 1000) ))
                 i=$(( i + 1 ))
             done
@@ -830,7 +855,7 @@ run_flatpak() {
             [[ $mode == update ]] || break
             flatpak_delta_failure "$log" "$mark" || break
             attempt=2; extra=(--no-static-deltas); note=' (senza delta)'
-            printf '%s\n' "--- ritento senza delta statici: flatpak update -y --no-static-deltas $ref" >>"$log"
+            printf '%s\n' "--- ritento senza delta statici: flatpak $op -y --no-static-deltas $ref" >>"$log"
             trace "delta rotto, ritento intero: $ref"
             cur_pct=0
         done

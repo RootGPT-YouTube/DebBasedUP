@@ -333,6 +333,7 @@ QUIET_TICKS=5
         """Flathub manda delta statici fuori misura e il pull muore a meta': quel
         ref va rilanciato con --no-static-deltas, una volta sola."""
         self.command("flatpak", """
+            [[ $1 == info ]] && exit 0        # gia' installato: si aggiorna
             printf '%s\\n' "$*" >> "$TEST_ROOT/flatpak-args"
             if [[ $* != *--no-static-deltas* ]]; then
                 printf 'Decompressed delta part exceeds configured limit\\n'
@@ -496,6 +497,61 @@ QUIET_TICKS=5
         self.assertEqual(
             (self.root / "uninstalled").read_text().splitlines(),
             ["runtime/org.kde.Platform/x86_64/6.10"])
+
+    def test_flatpak_update_list_includes_missing_extensions(self):
+        """remote-ls vede solo cio' che e' installato. Sul gemello Fedora OBS
+        passato a freedesktop 26.08 voleva LinuxAudio.Plugins.CMT 26.08, che
+        non c'era: il centro software lo mostrava, `aggiorna` diceva "nothing
+        to do" (26 ott 2026). Quelle righe le ha solo il piano di `flatpak
+        update`."""
+        self.command("flatpak", r"""
+            case $1 in
+                remote-ls) printf 'app/com.brave.Browser/x86_64/stable\n'; exit 0 ;;
+                --default-arch) printf 'x86_64\n'; exit 0 ;;
+                update) ;;
+                *) exit 1 ;;
+            esac
+            printf 'Looking for updates…\n\n\n'
+            printf ' 1.\t   \tcom.brave.Browser\tstable\tu\tflathub\t< 120 MB\n'
+            printf ' 2.\t   \torg.freedesktop.LinuxAudio.Plugins.CMT\t26.08\ti\tflathub\t< 54,3 kB\n'
+            printf ' 3.\t   \torg.freedesktop.Platform.Debug\t26.08\ti\tflathub\t< 1 GB\n'
+            printf '\nProceed with these changes to the system installation? [Y/n]: '
+            IFS= read -r answer
+            [[ $answer == n ]] || printf 'ANSWERED-%s\n' "$answer" >> "$TEST_ROOT/forbidden"
+        """)
+        output = self.bash("flatpak_refs update")
+        self.assertEqual(
+            output.splitlines(),
+            ["app/com.brave.Browser/x86_64/stable",
+             "runtime/org.freedesktop.LinuxAudio.Plugins.CMT/x86_64/26.08"])
+
+    def test_flatpak_update_installs_refs_not_yet_there(self):
+        """Un'estensione che manca non si puo' aggiornare: `flatpak update`
+        la rifiuta perche' non e' installata, serve install. Se un ref
+        precedente se l'e' portata dietro, resta un update che non fa niente."""
+        self.command("flatpak", r"""
+            state="$TEST_ROOT/installed"
+            [[ -e $state ]] || printf 'app/com.obsproject.Studio/x86_64/stable\n' >"$state"
+            if [[ $1 == info ]]; then grep -qxF "$2" "$state"; exit; fi
+            printf '%s\n' "$1 ${!#}" >> "$TEST_ROOT/flatpak-ops"
+            case $1 in
+                update) grep -qxF "${!#}" "$state" || {
+                            printf 'error: %s not installed\n' "${!#}" >&2; exit 1; } ;;
+                install) printf '%s\n' "${!#}" >>"$state" ;;
+                *) exit 1 ;;
+            esac
+            printf '100%%\n'
+        """)
+        self.bash("""
+            run_flatpak Test-install update 0 1000 \
+                app/com.obsproject.Studio/x86_64/stable \
+                runtime/org.freedesktop.LinuxAudio.Plugins.CMT/x86_64/26.08
+            (( steps_ok == 1 && steps_fail == 0 ))
+        """)
+        self.assertEqual(
+            (self.root / "flatpak-ops").read_text().splitlines(),
+            ["update app/com.obsproject.Studio/x86_64/stable",
+             "install runtime/org.freedesktop.LinuxAudio.Plugins.CMT/x86_64/26.08"])
 
     def test_flatpak_unused_list_gives_full_refs(self):
         """`uninstall --unused` mostra id e branch separati: col solo id
