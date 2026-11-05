@@ -329,6 +329,76 @@ QUIET_TICKS=5
             (( steps_ok == 0 && steps_fail == 2 ))
         """)
 
+    # Testi veri: apt 2.6.2 e 3.0.4, repo con indici gia' scaricati e chiave
+    # cambiata (rc=0), e repo senza indici precedenti (rc=100).
+    APT_26_OLD_LISTS = (
+        "W: An error occurred during the signature verification. The repository is "
+        "not updated and the previous index files will be used. GPG error: "
+        "http://deb.example.org/debian bookworm-backports InRelease: The following "
+        "signatures couldn't be verified because the public key is not available: "
+        "NO_PUBKEY 6ED0E7B82643E131\\n"
+        "W: Failed to fetch http://deb.example.org/debian/dists/bookworm-backports/InRelease  "
+        "The following signatures couldn't be verified\\n"
+        "W: Some index files failed to download. They have been ignored, or old ones "
+        "used instead.\\n")
+    APT_30_OLD_LISTS = (
+        "W: An error occurred during the signature verification. The repository is "
+        "not updated and the previous index files will be used. OpenPGP signature "
+        "verification failed: http://deb.example.org/debian trixie-backports InRelease: "
+        "Sub-process /usr/bin/sqv returned an error code (1), error message is: "
+        "Missing key 4CB50190207B4758A3F73A796ED0E7B82643E131\\n")
+    APT_NO_OLD_LISTS = (
+        "W: GPG error: https://vendor.example.com:8443/apt stable InRelease: "
+        "The following signatures couldn't be verified: NO_PUBKEY 6ED0E7B82643E131\\n"
+        "E: The repository 'https://vendor.example.com:8443/apt stable InRelease' is "
+        "not signed.\\n")
+
+    def plan_with_update_output(self, text, update_rc):
+        self.command("sudo", f"""
+            for arg; do
+                [[ $arg == update ]] && {{ printf '%b' {text!r}; exit {update_rc}; }}
+            done
+            exit 0
+        """)
+        self.command("flatpak", "exit 0")
+        return self.bash("""
+            plan_phase
+            printf 'REPO=<%s>\\n' "${UNVERIFIED_REPOS[@]}"
+            report_unverified_repos
+            printf 'FAIL=%d\\n' "$steps_fail"
+        """)
+
+    def test_rotated_key_with_old_lists_is_reported_although_apt_exits_0(self):
+        for text, repo in (
+                (self.APT_26_OLD_LISTS, "http://deb.example.org/debian bookworm-backports"),
+                (self.APT_30_OLD_LISTS, "http://deb.example.org/debian trixie-backports")):
+            output = self.plan_with_update_output(text, 0)
+            self.assertIn(f"REPO=<{repo}>", output)
+            self.assertIn("not refreshed: 1", output)
+            self.assertIn("FAIL=1", output)
+
+    def test_unsigned_repo_is_named_once_and_port_survives(self):
+        output = self.plan_with_update_output(self.APT_NO_OLD_LISTS, 100)
+        self.assertEqual(output.count("REPO=<"), 1)
+        self.assertIn("REPO=<https://vendor.example.com:8443/apt stable>", output)
+
+    def test_clean_update_reports_nothing(self):
+        output = self.plan_with_update_output(
+            "Hit:1 http://deb.example.org/debian trixie InRelease\\n", 0)
+        self.assertNotIn("not refreshed", output)
+        self.assertIn("FAIL=0", output)
+
+    def test_signature_handling_never_disables_the_check(self):
+        for word in ("allow-unauthenticated", "AllowInsecureRepositories",
+                     "AllowDowngradeToInsecureRepositories", "trusted=yes"):
+            self.assertNotIn(word, SOURCE)
+
+    def test_kept_back_packages_are_not_a_broken_state(self):
+        log = self.root / "apt.log"
+        log.write_text("The following packages have been kept back:\n  libfoo\n"
+                       "0 upgraded, 0 newly installed, 0 to remove and 1 not upgraded.\n")
+        self.bash(f'! apt_looks_broken "{log}"')
+
     def test_flatpak_delta_retry(self):
         """Flathub manda delta statici fuori misura e il pull muore a meta': quel
         ref va rilanciato con --no-static-deltas, una volta sola."""

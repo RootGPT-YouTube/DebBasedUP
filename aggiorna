@@ -530,7 +530,7 @@ plan_phase() {
     local tmp; tmp=$(mktemp)
     (
         # one metadata refresh; the upgrade below reuses these lists
-        sudo -n env LC_ALL=C apt-get update >/dev/null 2>&1
+        sudo -n env LC_ALL=C apt-get update >"$tmp.update" 2>&1
         upg=$(apt_count install sudo -n env LC_ALL=C apt-get -s full-upgrade)
         rem=$(apt_count remove  sudo -n env LC_ALL=C apt-get -s autoremove)
         mapfile -t fu < <(flatpak_refs update)
@@ -558,6 +558,8 @@ plan_phase() {
     mapfile -t FU_REFS < <(sed -n '/^FU=/,/^__FUEND__$/p' "$tmp" | sed '1s/^FU=//; /^__FUEND__$/d; /^$/d')
     mapfile -t FX_REFS < <(sed -n '/^FX=/,/^__FXEND__$/p' "$tmp" | sed '1s/^FX=//; /^__FXEND__$/d; /^$/d')
     rm -f "$tmp"
+    mapfile -t UNVERIFIED_REPOS < <(apt_signature_repos "$tmp.update")
+    drop_log "$tmp.update" "apt-get update"
 
     local nfu=${#FU_REFS[@]} nfx=${#FX_REFS[@]}
     G_TOTAL_PKG=$(( APT_UPG + APT_REM + nfu + nfx ))
@@ -585,6 +587,41 @@ plan_phase() {
     draw_total_footer 0
     printf '\r   %s●%s  Planning complete  %s(%d package(s) to process)%s\e[K\n' \
         "$GREEN" "$RESET" "$DIM" "$G_TOTAL_PKG" "$RESET"
+}
+
+#== Repositories whose signature apt refused =================================
+# A vendor that rotates its signing key does not stop an upgrade here, unlike on
+# dnf: apt checks the repository's lists, not each package. It keeps that repo's
+# old lists and goes on, and `apt-get update` even exits 0 when old lists exist:
+# measured with apt 2.6.2 and 3.0.4, a repo already fetched, then a key it no
+# longer matches. Nothing fails and that repo silently stops getting updates, so
+# someone has to say so. The wording differs between the two versions:
+#   W: GPG error: <url> <suite> InRelease: ... NO_PUBKEY ...          (2.6)
+#   W: OpenPGP signature verification failed: <url> <suite> InRelease: ...  (3.0)
+#   E: The repository '<url> <suite> InRelease' is not signed.        (no old lists)
+apt_signature_repos() {
+    sed -nE -e 's/^W: .*(OpenPGP signature verification failed|GPG error): ([^ ]+ [^:]*): .*/\2/p' \
+            -e "s/^E: The repository '([^']+)' is not signed.*/\\1/p" "$1" 2>/dev/null |
+        sed -E 's/ (In)?Release$//' | sort -u
+}
+
+# Trusting a new key is the user's call: nothing here installs one.
+report_unverified_repos() {
+    (( ${#UNVERIFIED_REPOS[@]} )) || return 0
+    connector
+    finish_node '⚠' "$GOLD" "Repository signatures — not refreshed: ${#UNVERIFIED_REPOS[@]}"
+    steps_fail=$(( steps_fail + 1 ))
+    printf '   %s┃%s\n' "$DIM" "$RESET"
+    printf '   %s┗━ not updated ──────────────────────────────%s\n' "$GOLD" "$RESET"
+    local repo
+    for repo in "${UNVERIFIED_REPOS[@]}"; do
+        printf '      %s│%s %s\n' "$DIM" "$RESET" "$repo"
+    done
+    printf '      %s│%s The signature of these repositories could not be verified: no new\n' "$DIM" "$RESET"
+    printf '      %s│%s packages from them. The rest of the system was updated as usual.\n' "$DIM" "$RESET"
+    printf '      %s│%s Usually the vendor rotated its signing key. Check the key it publishes,\n' "$DIM" "$RESET"
+    printf '      %s│%s then update the keyring its Signed-By points to.\n' "$DIM" "$RESET"
+    printf '   %s──────────────────────────────────────────────%s\n' "$GOLD" "$RESET"
 }
 
 #== Broken-state auto-repair =================================================
@@ -1091,6 +1128,7 @@ plan_phase
 # Each step is handed its slice of the TOTAL bar computed in plan_phase.
 run_apt      "System upgrade (APT)"        "Install" "$APT_UPG" 0          "$B_DLU_HI" "$B_DLU_HI" "$B_INU_HI" \
     sudo -n "${UNBUF[@]}" env LC_ALL=C DEBIAN_FRONTEND=noninteractive apt-get -y -q -o Dpkg::Use-Pty=0 full-upgrade
+report_unverified_repos
 run_apt      "Removing orphaned packages"  "Remove"  "$APT_REM" "$B_INU_HI" "$B_INU_HI" "$B_INU_HI" "$B_INA_HI" \
     sudo -n "${UNBUF[@]}" env LC_ALL=C DEBIAN_FRONTEND=noninteractive apt-get -y -q -o Dpkg::Use-Pty=0 autoremove
 run_flatpak  "Updating Flatpaks"           update "$B_INA_HI" "$B_FPU_HI" "${FU_REFS[@]}"
