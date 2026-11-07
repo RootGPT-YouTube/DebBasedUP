@@ -34,6 +34,7 @@ G_TOTAL_PKG=0    # total packages across every section (Cromite excluded) — la
 APT_UPG=0
 APT_REM=0
 FU_REFS=()       # Flatpak refs to update
+FU_UNREACH=()    # Flatpak remotes that could not be checked for updates
 FX_REFS=()       # unused Flatpak refs to remove
 
 # Per-mille band boundaries on the TOTAL bar (filled by plan_phase). Each section
@@ -478,10 +479,46 @@ apt_count() {
 # colonna dell'operazione: si leggono rispondendo "n". Se il piano si ferma
 # sulla domanda del runtime mancante (vedi sopra) queste righe mancano, ma
 # l'elenco di remote-ls resta intero.
+#
+# Un remote alla volta, pero'. Senza nome di remote, remote-ls li interroga
+# tutti, e al primo che non risponde abbandona l'intero elenco ("Unable to load
+# summary from remote ..."). Con stderr buttato via restava un elenco vuoto e il
+# passo diceva "nothing to do" con gli aggiornamenti in coda (caso reale sul
+# gemello Fedora, 7 nov 2026: lanciato un minuto dopo l'avvio, cinque app
+# saltate senza una parola; li' bastava il registro OCI `fedora`, lento e da
+# cui non era installato niente). Qualunque remote in piu' fa lo stesso.
+# Quindi: solo i remote abilitati da cui viene qualcosa di installato, uno per
+# volta, un secondo tentativo dopo 3 s, e chi non risponde nemmeno allora esce
+# come riga "!remote", che il passo Flatpak mostra invece di tacere.
 flatpak_refs() {
     if [[ $1 == update ]]; then
-        env LC_ALL=C flatpak remote-ls --updates --all --columns=ref 2>/dev/null |
-            awk -F/ 'NF && $2 !~ /\.(Locale|Debug|Sources)$/ && !seen[$0]++'
+        local pairs inst remote out
+        pairs=$(
+            {
+                env LC_ALL=C flatpak list --all --columns=installation,origin 2>/dev/null |
+                    awk -F'\t' 'NF == 2 { print "O\t" $1 "\t" $2 }'
+                env LC_ALL=C flatpak remotes --columns=name,options 2>/dev/null |
+                    awk -F'\t' 'NF == 2 { split($2, o, ","); print "R\t" o[1] "\t" $1 }'
+            } | awk -F'\t' '$1 == "O" { used[$2 FS $3] = 1; next }
+                            ($2 FS $3) in used && !seen[$2 FS $3]++ { print $2 "\t" $3 }'
+        )
+        # Niente coppie (elenchi illeggibili): la vecchia via, tutti insieme.
+        [[ -n $pairs ]] || pairs=$'\t'
+        while IFS=$'\t' read -r inst remote; do
+            local where=()
+            case $inst in
+                '')     ;;
+                system) where=(--system) ;;
+                user)   where=(--user) ;;
+                *)      where=(--installation="$inst") ;;
+            esac
+            out=$(env LC_ALL=C flatpak remote-ls "${where[@]}" --updates --all --columns=ref ${remote:+"$remote"} 2>/dev/null) ||
+                { sleep "${FP_RETRY_WAIT:-3}"
+                  out=$(env LC_ALL=C flatpak remote-ls "${where[@]}" --updates --all --columns=ref ${remote:+"$remote"} 2>/dev/null); } ||
+                { printf '!%s\n' "${remote:-flatpak remotes}"; continue; }
+            printf '%s\n' "$out"
+        done <<<"$pairs" |
+            awk -F/ '/^!/ || (NF && $2 !~ /\.(Locale|Debug|Sources)$/) { if (!seen[$0]++) print }'
         local missing
         missing=$(printf 'n\n' | env LC_ALL=C flatpak update 2>/dev/null |
             awk -F'\t' '/^[[:space:]]*[0-9]+\./ {
@@ -556,6 +593,12 @@ plan_phase() {
     APT_UPG=$(sed -n 's/^P_UPG=//p' "$tmp"); APT_UPG=${APT_UPG:-0}
     APT_REM=$(sed -n 's/^P_REM=//p' "$tmp"); APT_REM=${APT_REM:-0}
     mapfile -t FU_REFS < <(sed -n '/^FU=/,/^__FUEND__$/p' "$tmp" | sed '1s/^FU=//; /^__FUEND__$/d; /^$/d')
+    # remote che non hanno risposto (vedi flatpak_refs): non sono ref
+    local fur; FU_UNREACH=(); local keep=()
+    for fur in "${FU_REFS[@]}"; do
+        if [[ $fur == '!'* ]]; then FU_UNREACH+=("${fur#!}"); else keep+=("$fur"); fi
+    done
+    FU_REFS=("${keep[@]}")
     mapfile -t FX_REFS < <(sed -n '/^FX=/,/^__FXEND__$/p' "$tmp" | sed '1s/^FX=//; /^__FXEND__$/d; /^$/d')
     rm -f "$tmp"
     mapfile -t UNVERIFIED_REPOS < <(apt_signature_repos "$tmp.update")
@@ -814,10 +857,18 @@ run_flatpak() {
     trace "inizio: $label"
     connector
 
+    local unreach=()
+    [[ $mode == update ]] && unreach=("${FU_UNREACH[@]}")
+
     if (( N == 0 )); then
         render_live "${SPIN[0]}" "$label" '00:00' 'nothing to do' 1 1
         draw_total_footer "$hi"
-        finish_node '●' "$GREEN" "$label"; steps_ok=$(( steps_ok + 1 )); drop_log "$log" "$label"; return
+        if (( ${#unreach[@]} )); then
+            finish_node '✗' "$GOLD" "$label"; steps_fail=$(( steps_fail + 1 )); unreachable_box "${unreach[@]}"
+        else
+            finish_node '●' "$GREEN" "$label"; steps_ok=$(( steps_ok + 1 ))
+        fi
+        drop_log "$log" "$label"; return
     fi
 
     local rc=0 start=$SECONDS i=0 idx=0 ref
@@ -900,12 +951,26 @@ run_flatpak() {
     done
 
     draw_total_footer "$hi"
-    if (( rc == 0 )); then
-        finish_node '●' "$GREEN" "$label"; steps_ok=$(( steps_ok + 1 ))
-    else
+    if (( rc != 0 )); then
         finish_node '✗' "$RED" "$label"; steps_fail=$(( steps_fail + 1 )); error_box "$log"
+        (( ${#unreach[@]} )) && unreachable_box "${unreach[@]}"
+    elif (( ${#unreach[@]} )); then
+        finish_node '✗' "$GOLD" "$label"; steps_fail=$(( steps_fail + 1 )); unreachable_box "${unreach[@]}"
+    else
+        finish_node '●' "$GREEN" "$label"; steps_ok=$(( steps_ok + 1 ))
     fi
     drop_log "$log" "$label"
+}
+
+# Remote che in fase di piano non hanno risposto nemmeno al secondo tentativo:
+# i loro aggiornamenti non sono stati visti, quindi non sono stati fatti.
+unreachable_box() {
+    printf '   %s┃%s\n' "$DIM" "$RESET"
+    printf '   %s┗━ not checked ──────────────────────────────%s\n' "$GOLD" "$RESET"
+    printf '      %s│%s remote %s did not answer while planning (tried twice)\n' "$DIM" "$RESET" "$@"
+    printf '      %s│%s its Flatpaks may have updates that were not installed.\n' "$DIM" "$RESET"
+    printf '      %s│%s Check the network, then run aggiorna again.\n' "$DIM" "$RESET"
+    printf '   %s──────────────────────────────────────────────%s\n' "$GOLD" "$RESET"
 }
 
 #== Reboot detection =========================================================

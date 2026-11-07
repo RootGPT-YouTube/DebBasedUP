@@ -595,6 +595,68 @@ QUIET_TICKS=5
             ["app/com.brave.Browser/x86_64/stable",
              "runtime/org.freedesktop.LinuxAudio.Plugins.CMT/x86_64/26.08"])
 
+    FLATPAK_TWO_REMOTES = r"""
+        case $1 in
+            list) printf 'system\tflathub\nsystem\tflathub\n'; exit 0 ;;
+            remotes) printf 'fedora\tsystem,oci\nflathub\tsystem\n'; exit 0 ;;
+            remote-ls) ;;
+            *) exit 1 ;;
+        esac
+        printf '%s\n' "$*" >> "$TEST_ROOT/remote-ls-calls"
+        remote=${!#}
+        [[ $remote == fedora ]] && {
+            printf 'error: Unable to load summary from remote fedora\n' >&2; exit 1; }
+        n=$(grep -c . "$TEST_ROOT/remote-ls-calls")
+        [[ -e $TEST_ROOT/flaky ]] && (( n == 1 )) && {
+            printf 'error: Unable to load summary from remote flathub\n' >&2; exit 1; }
+        [[ -e $TEST_ROOT/down ]] && {
+            printf 'error: Unable to load summary from remote flathub\n' >&2; exit 1; }
+        printf 'app/com.brave.Browser/x86_64/stable\napp/org.telegram.desktop/x86_64/stable\n'
+    """
+
+    def test_flatpak_update_list_survives_a_remote_that_does_not_answer(self):
+        """Senza nome di remote, remote-ls abbandona l'intero elenco al primo
+        remote che non risponde, e lo script diceva "nothing to do" (caso
+        reale sul gemello Fedora, 7 nov 2026: cinque app saltate). Si
+        interrogano solo i remote da cui e' installato qualcosa, uno per volta:
+        `fedora`, che qui non fornisce niente, non viene nemmeno toccato."""
+        self.command("flatpak", self.FLATPAK_TWO_REMOTES)
+        output = self.bash("FP_RETRY_WAIT=0; flatpak_refs update")
+        self.assertEqual(output.splitlines(),
+                         ["app/com.brave.Browser/x86_64/stable",
+                          "app/org.telegram.desktop/x86_64/stable"])
+        self.assertEqual(
+            (self.root / "remote-ls-calls").read_text().splitlines(),
+            ["remote-ls --system --updates --all --columns=ref flathub"])
+
+    def test_flatpak_update_list_retries_a_remote_once(self):
+        """Un intoppo passeggero (rete appena salita) costa un secondo
+        tentativo, non l'elenco."""
+        self.command("flatpak", self.FLATPAK_TWO_REMOTES)
+        (self.root / "flaky").touch()
+        output = self.bash("FP_RETRY_WAIT=0; flatpak_refs update")
+        self.assertEqual(output.splitlines(),
+                         ["app/com.brave.Browser/x86_64/stable",
+                          "app/org.telegram.desktop/x86_64/stable"])
+
+    def test_flatpak_unreachable_remote_is_reported_not_silent(self):
+        """Un remote che non risponde nemmeno al secondo tentativo non diventa
+        "nothing to do": il passo Flatpak lo dice e non e' verde."""
+        self.command("flatpak", self.FLATPAK_TWO_REMOTES)
+        (self.root / "down").touch()
+        output = self.bash("""
+            FP_RETRY_WAIT=0
+            mapfile -t got < <(flatpak_refs update)
+            printf 'GOT=<%s>\\n' "${got[@]}"
+            FU_UNREACH=(flathub)
+            run_flatpak Test-update update 0 1000
+            printf 'OK=%d FAIL=%d\\n' "$steps_ok" "$steps_fail"
+        """)
+        self.assertIn("GOT=<!flathub>", output)
+        self.assertIn("not checked", output)
+        self.assertIn("remote flathub did not answer", output)
+        self.assertIn("OK=0 FAIL=1", output)
+
     def test_flatpak_update_installs_refs_not_yet_there(self):
         """Un'estensione che manca non si puo' aggiornare: `flatpak update`
         la rifiuta perche' non e' installata, serve install. Se un ref
