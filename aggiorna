@@ -1109,6 +1109,106 @@ disclaimer() {
     printf '\e[?25h'                      # la password va digitata a cursore visibile
 }
 
+#== Step 0: lo script si aggiorna PRIMA di fare qualsiasi altra cosa =========
+# Fino al 7 nov 2026 l'autoaggiornamento stava in fondo al giro: il giro in
+# corso finiva con la versione vecchia (bash tiene aperto il file che sta
+# leggendo, il `mv` crea un inode nuovo) e la correzione appena pubblicata
+# entrava in gioco solo al giro DOPO. Visto quel giorno sul gemello Fedora: la
+# correzione dei Flatpak pubblicata alle 07:59, il giro delle 08:04 l'ha fatta
+# col codice vecchio e lo script si e' sostituito solo a giro finito.
+#
+# Ora e' il passo 0: dopo il consenso e la password (serve sudo per scrivere in
+# /usr/local/bin), prima del piano. Se GitHub ha una versione diversa la si
+# installa e la si rilancia con `exec`: il resto del giro lo fa la versione
+# nuova. `exec` tiene lo stesso PID, ed e' cosi' che la versione nuova sa di
+# essere un rilancio (AGGIORNA_RELAUNCHED=$$): non ripropone l'avviso appena
+# accettato e non si riaggiorna, quindi niente giri a vuoto. Un valore rimasto
+# nell'ambiente da un altro processo non combacia col PID e non conta.
+#
+# Un download troncato o rotto non deve mai sostituire uno script buono: prima
+# di installarlo deve iniziare con `#!` e passare `bash -n`.
+#
+# Solo la copia installata si aggiorna da sola. Una copia lanciata da un'altra
+# parte (`./aggiorna` nel repo, per provare una correzione non ancora
+# pubblicata) verrebbe sostituita a meta' prova dalla versione di GitHub.
+SELF_PATH=/usr/local/bin/aggiorna
+SELF_RUNNING=$0
+SELF_URL=https://raw.githubusercontent.com/RootGPT-YouTube/DebBasedUP/main/aggiorna
+SELF_RELAUNCH=10        # codice di ritorno di self_update: rilanciare SELF_PATH
+
+self_update() {
+    local label='Step 0: updating aggiorna itself' tmp pid i=0 start=$SECONDS
+    trace "inizio: $label"
+    connector
+
+    if [[ ${AGGIORNA_RELAUNCHED:-} == "$$" ]]; then
+        SCRIPT_UPDATE='updated ✓'
+        printf '\r   %s●%s  %s   %s(updated, now running the new version)%s\e[K\n' \
+            "$GREEN" "$RESET" "$label" "$DIM" "$RESET"
+        steps_ok=$(( steps_ok + 1 )); trace "fine:   $label (rilanciato)"; return 0
+    fi
+
+    if [[ $(readlink -f -- "$SELF_RUNNING" 2>/dev/null) != "$(readlink -f -- "$SELF_PATH" 2>/dev/null)" ]]; then
+        SCRIPT_UPDATE='skipped (local copy)'
+        printf '\r   %s●%s  %s   %s(running a copy outside %s: not touched)%s\e[K\n' \
+            "$GREEN" "$RESET" "$label" "$DIM" "$SELF_PATH" "$RESET"
+        steps_ok=$(( steps_ok + 1 )); trace "fine:   $label (copia locale)"; return 0
+    fi
+
+    tmp=$(mktemp) || { SCRIPT_UPDATE='not checked'; return 0; }
+    # Timeout espliciti: senza, un GitHub che non risponde lascerebbe curl
+    # appeso a tempo indefinito proprio qui, prima ancora del piano.
+    curl -fsSL --connect-timeout 10 --max-time 60 "$SELF_URL" -o "$tmp" 2>/dev/null &
+    pid=$!
+    while kill -0 "$pid" 2>/dev/null; do
+        printf '\r   %s%s%s  %s   %s%s%s\e[K' \
+            "$CYAN" "${SPIN[i%6]}" "$RESET" "$label" "$DIM" "$(fmt_time $(( SECONDS - start )))" "$RESET"
+        i=$(( i + 1 )); sleep 0.12
+    done
+
+    local note color='' sym='●'
+    if ! wait "$pid"; then
+        SCRIPT_UPDATE='not checked'; color=$GOLD; note='GitHub unreachable, continuing with this version'
+    elif [[ $(head -c 2 "$tmp") != '#!' ]] || ! bash -n "$tmp" 2>/dev/null; then
+        SCRIPT_UPDATE='error ✗'; color=$RED; sym='✗'; note='download not valid, kept this version'
+    elif cmp -s "$tmp" "$SELF_PATH"; then
+        SCRIPT_UPDATE='already up to date'; color=$GREEN; note='already up to date'
+    elif chmod 755 "$tmp" && sudo -n mv "$tmp" "$SELF_PATH"; then
+        printf '\r   %s●%s  %s   %s(updated, restarting on the new version…)%s\e[K\n' \
+            "$GREEN" "$RESET" "$label" "$DIM" "$RESET"
+        trace "fine:   $label (aggiornato, rilancio)"
+        return "$SELF_RELAUNCH"
+    else
+        SCRIPT_UPDATE='error ✗'; color=$RED; sym='✗'; note='could not install, kept this version'
+    fi
+    rm -f "$tmp"
+    printf '\r   %s%s%s  %s   %s(%s)%s\e[K\n' "$color" "$sym" "$RESET" "$label" "$DIM" "$note" "$RESET"
+    if [[ $sym == '✗' ]]; then steps_fail=$(( steps_fail + 1 )); else steps_ok=$(( steps_ok + 1 )); fi
+    trace "fine:   $label ($SCRIPT_UPDATE)"
+    return 0
+}
+
+# Prima del rilancio: lo schermo sta per essere pulito e ridisegnato, e senza
+# una parola sembrerebbe un crash o un giro ricominciato da capo. Si dice cosa
+# succede e perché, e si lasciano RELAUNCH_WAIT secondi per leggerlo, con il
+# conto alla rovescia visibile (richiesta dell'utente, 7 nov 2026).
+RELAUNCH_WAIT=10
+relaunch_notice() {
+    local n
+    printf '   %s┃%s\n' "$DIM" "$RESET"
+    printf '   %s┗━ aggiorna was updated ──────────────────────%s\n' "$GOLD" "$RESET"
+    printf '      %s│%s A newer version of this script was found on GitHub and installed.\n' "$DIM" "$RESET"
+    printf '      %s│%s It now restarts by itself, so the whole update runs on the new\n' "$DIM" "$RESET"
+    printf '      %s│%s version. Nothing has been changed on the system yet, and you will\n' "$DIM" "$RESET"
+    printf '      %s│%s not be asked to accept the notice again.\n' "$DIM" "$RESET"
+    printf '   %s──────────────────────────────────────────────%s\n' "$GOLD" "$RESET"
+    for (( n = RELAUNCH_WAIT; n > 0; n-- )); do
+        printf '\r   %s⟳%s  Restarting in %s%2d%s s…\e[K' "$GOLD" "$RESET" "$BOLD" "$n" "$RESET"
+        sleep 1
+    done
+    printf '\r   %s⟳%s  Restarting now…\e[K\n' "$GOLD" "$RESET"
+}
+
 #== Report card =============================================================
 card_line() {
     local label="$1" value="$2" vcolor="$3"
@@ -1166,8 +1266,13 @@ clear
 setup_footer
 header
 
-# Nulla viene toccato finché l'utente non accetta
-disclaimer
+# Nulla viene toccato finché l'utente non accetta. Nel rilancio dopo
+# l'autoaggiornamento (passo 0) l'avviso è già stato accettato un attimo fa.
+if [[ ${AGGIORNA_RELAUNCHED:-} != "$$" ]]; then
+    disclaimer
+else
+    printf '\e[?25h'
+fi
 
 # Root credentials + keep-alive (steps read package-manager output through a
 # pipe, so sudo must never stop to ask for the password mid-run). Captured steps
@@ -1181,6 +1286,20 @@ fi
 SUDO_PID=$!
 
 printf '\e[?25l'                                        # hide the cursor
+
+# Step 0: prima di tutto lo script si aggiorna, e se cambia si rilancia (vedi
+# self_update). Il keep-alive di sudo va fermato a mano: `exec` non passa dalla
+# trap EXIT e il ciclo, che controlla il PID (lo stesso dopo exec), resterebbe
+# vivo accanto a quello della versione nuova.
+if self_update; then :; else
+    if (( $? == SELF_RELAUNCH )); then
+        relaunch_notice
+        kill "$SUDO_PID" 2>/dev/null
+        export AGGIORNA_RELAUNCHED=$$
+        exec "$SELF_PATH" "$@"
+    fi
+fi
+
 START_AVAIL=$(df --output=avail / | tail -1 | tr -d ' ')
 
 # Resolve everything first (one metadata refresh), so the TOTAL bar is exact.
@@ -1207,41 +1326,18 @@ fi
 END_AVAIL=$(df --output=avail / | tail -1 | tr -d ' ')
 teardown_footer
 
-#== Script self-update ======================================================
 # Fra l'ultimo nodo della pipeline e la scheda di resoconto c'e' un passo che non
-# disegna niente: l'autoaggiornamento via rete. Se va per le lunghe lo schermo
-# resta fermo sull'ultimo nodo senza spiegare perche' — e uno schermo fermo e
-# muto e' indistinguibile da uno script piantato. Una riga, almeno, dice a che
-# punto siamo.
+# disegna niente: l'analisi del riavvio. Se va per le lunghe lo schermo resta
+# fermo sull'ultimo nodo senza spiegare perche' — e uno schermo fermo e muto e'
+# indistinguibile da uno script piantato. Una riga, almeno, dice a che punto
+# siamo. (L'autoaggiornamento che stava qui e' diventato il passo 0, all'inizio.)
 printf '   %s┃%s\n' "$DIM" "$RESET"
-printf '   %s⋯  controlli finali e autoaggiornamento…%s\n' "$DIM" "$RESET"
+printf '   %s⋯  controlli finali…%s\n' "$DIM" "$RESET"
 
 # Everything that only takes effect after a restart (kernel, core libs)
 trace "inizio: analisi riavvio"
 detect_reboot_needed || true
 trace "fine:   analisi riavvio (${#REBOOT_REASONS[@]} motivi)"
-
-# Timeout espliciti: senza, un mirror che non risponde lascia curl appeso a
-# tempo indeterminato proprio qui, dove non si muove piu' niente a schermo.
-trace "inizio: autoaggiornamento"
-if curl -fsSL --connect-timeout 10 --max-time 60 \
-        https://raw.githubusercontent.com/RootGPT-YouTube/DebBasedUP/main/aggiorna \
-        -o /tmp/aggiorna.tmp 2>/dev/null; then
-    if ! cmp -s /tmp/aggiorna.tmp /usr/local/bin/aggiorna 2>/dev/null; then
-        if sudo mv /tmp/aggiorna.tmp /usr/local/bin/aggiorna && sudo chmod a+x /usr/local/bin/aggiorna; then
-            SCRIPT_UPDATE='updated ✓'
-        else
-            SCRIPT_UPDATE='error ✗'
-        fi
-    else
-        SCRIPT_UPDATE='already up to date'
-        rm -f /tmp/aggiorna.tmp
-    fi
-else
-    rm -f /tmp/aggiorna.tmp
-    SCRIPT_UPDATE='not checked'
-fi
-trace "fine:   autoaggiornamento ($SCRIPT_UPDATE)"
 
 #== Report ==================================================================
 report_card

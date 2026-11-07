@@ -657,6 +657,106 @@ QUIET_TICKS=5
         self.assertIn("remote flathub did not answer", output)
         self.assertIn("OK=0 FAIL=1", output)
 
+    def self_update_setup(self, published, installed="#!/bin/bash\necho vecchio\n"):
+        """Finti curl (scarica `published`, o fallisce se None) e sudo (esegue
+        il comando togliendo -n); lo script "installato" sta in TEST_ROOT."""
+        (self.root / "installed").write_text(installed)
+        if published is None:
+            self.command("curl", 'echo "$*" >> "$TEST_ROOT/curl-calls"; exit 7')
+        else:
+            (self.root / "published").write_text(published)
+            self.command("curl", r"""
+                echo "$*" >> "$TEST_ROOT/curl-calls"
+                while (( $# )); do [[ $1 == -o ]] && { cp "$TEST_ROOT/published" "$2"; exit 0; }; shift; done
+                exit 2
+            """)
+        self.command("sudo", r"""
+            [[ $1 == -n ]] && shift
+            echo "$*" >> "$TEST_ROOT/sudo-calls"
+            "$@"
+        """)
+        return """
+            SELF_PATH=$TEST_ROOT/installed
+            SELF_RUNNING=$TEST_ROOT/installed
+            self_update; printf 'RC=%d UPDATE=<%s> OK=%d FAIL=%d\\n' $? "$SCRIPT_UPDATE" "$steps_ok" "$steps_fail"
+        """
+
+    def test_self_update_installs_a_new_version_and_asks_to_relaunch(self):
+        """Passo 0: una versione diversa su GitHub si installa subito e il
+        chiamante deve rilanciarla, cosi' il giro lo fa la versione nuova (il
+        7 nov 2026 la correzione dei Flatpak e' entrata solo a fine giro)."""
+        body = self.self_update_setup("#!/bin/bash\necho nuovo\n")
+        output = self.bash(body)
+        self.assertIn("RC=10", output)
+        self.assertEqual((self.root / "installed").read_text(), "#!/bin/bash\necho nuovo\n")
+        self.assertTrue(os.access(self.root / "installed", os.X_OK))
+        self.assertEqual(oct((self.root / "installed").stat().st_mode & 0o777), "0o755")
+
+    def test_self_update_same_version_goes_on(self):
+        body = self.self_update_setup("#!/bin/bash\necho vecchio\n")
+        output = self.bash(body)
+        self.assertIn("RC=0 UPDATE=<already up to date> OK=1 FAIL=0", output)
+        self.assertFalse((self.root / "sudo-calls").exists())
+
+    def test_self_update_never_installs_a_broken_download(self):
+        """Un download troncato o che non e' uno script non sostituisce mai
+        quello buono."""
+        for broken in ("#!/bin/bash\nif true; then\n", "<html>404</html>\n", ""):
+            with self.subTest(broken=broken):
+                body = self.self_update_setup(broken)
+                output = self.bash(body)
+                self.assertIn("RC=0 UPDATE=<error ✗>", output)
+                self.assertIn("FAIL=1", output)
+                self.assertEqual((self.root / "installed").read_text(), "#!/bin/bash\necho vecchio\n")
+                self.assertFalse((self.root / "sudo-calls").exists())
+
+    def test_self_update_without_network_goes_on(self):
+        body = self.self_update_setup(None)
+        output = self.bash(body)
+        self.assertIn("RC=0 UPDATE=<not checked> OK=1 FAIL=0", output)
+        self.assertIn("GitHub unreachable", output)
+
+    def test_self_update_after_relaunch_does_not_loop(self):
+        """Dopo `exec` il PID e' lo stesso: la versione nuova si riconosce e
+        non si riaggiorna. Un valore con un altro PID non conta."""
+        body = self.self_update_setup("#!/bin/bash\necho ancora-piu-nuovo\n")
+        output = self.bash("AGGIORNA_RELAUNCHED=$$\n" + body)
+        self.assertIn("RC=0 UPDATE=<updated ✓> OK=1", output)
+        self.assertFalse((self.root / "curl-calls").exists())
+        output = self.bash("AGGIORNA_RELAUNCHED=1\n" + body)
+        self.assertIn("RC=10", output)
+
+    def test_self_update_leaves_a_local_copy_alone(self):
+        """`./aggiorna` lanciato dal repo non viene sostituito a meta' prova."""
+        body = self.self_update_setup("#!/bin/bash\necho nuovo\n").replace(
+            "SELF_RUNNING=$TEST_ROOT/installed", "SELF_RUNNING=$TEST_ROOT/copia-locale")
+        output = self.bash(body)
+        self.assertIn("RC=0 UPDATE=<skipped (local copy)>", output)
+        self.assertFalse((self.root / "curl-calls").exists())
+        self.assertEqual((self.root / "installed").read_text(), "#!/bin/bash\necho vecchio\n")
+
+    def test_relaunch_notice_counts_down_before_restarting(self):
+        """Prima del rilancio l'utente legge perche' lo schermo ripartira', con
+        un conto alla rovescia visibile (richiesta dell'utente, 7 nov 2026)."""
+        start = time.monotonic()
+        output = self.bash("RELAUNCH_WAIT=2; relaunch_notice")
+        self.assertGreaterEqual(time.monotonic() - start, 1.9)
+        self.assertIn("aggiorna was updated", output)
+        self.assertIn("restarts by itself", output)
+        self.assertLess(output.index("Restarting in \x1b[1m 2"), output.index("Restarting in \x1b[1m 1"))
+        self.assertIn("Restarting now", output)
+        self.assertEqual(SOURCE.count("\nRELAUNCH_WAIT=10\n"), 1)
+
+    def test_main_flow_runs_self_update_before_planning(self):
+        """Il passo 0 viene dopo password e keep-alive, prima del piano; in
+        fondo non resta un secondo autoaggiornamento."""
+        main = SOURCE.split("#== START", 1)[1]
+        self.assertLess(main.index("sudo -v"), main.index("self_update"))
+        self.assertLess(main.index("self_update"), main.index("plan_phase"))
+        self.assertNotIn("githubusercontent", main)
+        self.assertIn('exec "$SELF_PATH" "$@"', main)
+        self.assertLess(main.index("relaunch_notice"), main.index('exec "$SELF_PATH"'))
+
     def test_flatpak_update_installs_refs_not_yet_there(self):
         """Un'estensione che manca non si puo' aggiornare: `flatpak update`
         la rifiuta perche' non e' installata, serve install. Se un ref
